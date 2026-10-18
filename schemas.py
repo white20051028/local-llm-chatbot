@@ -33,10 +33,32 @@ class ChatMessage(BaseModel):
     content: str = Field(..., min_length=1, max_length=8_000, description="消息正文")
 
 
+# /docs 里「Try it out」会预填这个示例。
+# 必须显式给，否则 Swagger UI 会自己造一个：它对枚举取第一个值，
+# 于是 history 被填成 [{"role": "system", ...}]，正好撞上下面那条禁令，
+# 结果是「照着文档点一下就 422」，非常误导人。
+# 这里给一个一定能通过的 body，让文档示例本身成为一条隐形的测试。
+EXAMPLE_REQUEST = {
+    "query": "用一句话解释什么是 RAG",
+    "sys_prompt": "你是一个简洁的助手",
+    "history": [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "你好，有什么可以帮你？"},
+    ],
+    "history_len": 4,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_tokens": 2048,
+}
+
+
 class ChatRequest(BaseModel):
     """POST /chat 的完整请求体。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": EXAMPLE_REQUEST},
+    )
 
     query: str = Field(..., min_length=1, max_length=8_000, description="用户本轮输入")
     sys_prompt: str = Field(

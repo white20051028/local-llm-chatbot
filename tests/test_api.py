@@ -193,3 +193,24 @@ def test_模型配置缺失时返回可读的错误(client, monkeypatch):
     r = client.post("/chat", json={}, headers=HEADERS)
     assert r.status_code == 500
     assert "SILICONFLOW" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------- 文档示例
+def test_openapi里的示例请求体本身是合法的(client):
+    """文档示例必须能通过校验。
+
+    Swagger UI 在枚举里取第一个值当示例，会把 history 填成 role="system"，
+    正好撞上「history 不允许出现 system」这条禁令，于是"照着文档点一下"就 422。
+    这条测试把「示例本身合法」钉死，防止以后再出现同样的坑。
+    """
+    from schemas import EXAMPLE_REQUEST, ChatRequest
+
+    schema = app.openapi()["components"]["schemas"]["ChatRequest"]
+    assert schema.get("example") == EXAMPLE_REQUEST
+
+    # 示例能被模型接受（不抛异常即通过）
+    ChatRequest.model_validate(EXAMPLE_REQUEST)
+
+    # 端到端再确认一次：拿这份示例发请求，不该是 4xx
+    r = client.post("/chat", json=EXAMPLE_REQUEST, headers=HEADERS)
+    assert r.status_code == 200
