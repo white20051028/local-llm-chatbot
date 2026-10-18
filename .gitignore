@@ -32,6 +32,11 @@ llm-dev/
 Thumbs.db
 desktop.ini
 
+# ===== 测试 =====
+.pytest_cache/
+.coverage
+htmlcov/
+
 # ===== 日志 =====
 *.log
 logs/
