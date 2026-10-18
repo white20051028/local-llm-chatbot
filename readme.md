@@ -156,6 +156,8 @@ python -m pytest -q
 ├── gradio_ui.py          # 前端：Gradio 聊天界面与参数面板
 ├── tests/
 │   └── test_api.py       # 接口测试（pytest）
+├── docs/
+│   └── TROUBLESHOOTING.md # 踩坑记录：六个真实故障的现象/根因/修法
 ├── pytest.ini            # pytest 配置
 ├── requirements.txt      # 运行时依赖
 ├── requirements-dev.txt  # 开发/测试依赖
@@ -163,6 +165,9 @@ python -m pytest -q
 ├── .env                  # 本地配置（不提交 Git）
 └── .gitignore
 ```
+
+> 这个项目从 demo 改成可用服务的过程中踩了六个坑（配置缺失被报成 500、文档示例自己不合法、Gradio 第二轮必 422……），
+> 每个坑的现象、排查过程、根因和修法都记在 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 里。
 
 ## ⚙️ 切换模型/服务
 
