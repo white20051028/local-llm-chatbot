@@ -1,11 +1,12 @@
 """FastAPI 后端：流式对话接口。
 
-本提交只做一件事：请求体改用 Pydantic 模型（schemas.py）校验，
-非法请求在进入函数前就返回 422。
+本 PR（feat/production-ready 第 1 步）做了三件事：
 
-顺带修掉一个 bug：原来 history_len=0（滑块最左=不保留历史）时，
-条件 `if history_len > 0 and ...` 不成立，反而把**全部**历史都带上了，
-与界面上"0 = 不保留"的语义相反。
+1. 请求体改用 Pydantic 模型（schemas.py）—— 非法请求在进入函数前就返回 422；
+2. 加 API Key 鉴权（auth.py）—— 只有带正确 X-API-Key 头的请求才放行；
+3. 顺手修掉一个 bug：原来 history_len=0（滑块最左=不保留历史）时，
+   条件 `if history_len > 0 and ...` 不成立，反而把**全部**历史都带上了，
+   与界面上"0 = 不保留"的语义相反。
 """
 
 import os
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_openai import ChatOpenAI
 
+from auth import require_api_key
 from schemas import ChatRequest
 
 # 加载环境变量。必须在任何 os.getenv 之前执行。
@@ -24,7 +26,7 @@ load_dotenv()
 
 app = FastAPI(
     title="本地对话机器人 API",
-    description="流式对话接口。请求体由 Pydantic 模型校验。",
+    description="带鉴权的流式对话接口。所有 /chat 请求需要在 Header 里带上 X-API-Key。",
     docs_url="/docs",
     redoc_url="/redoc",
     swagger_js_url="https://cdn.bootcdn.net/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.min.js",
@@ -71,13 +73,17 @@ async def on_request_validation_error(request: Request, exc: RequestValidationEr
     return JSONResponse(status_code=422, content={"detail": details})
 
 
-@app.get("/health", summary="健康检查")
+@app.get("/health", summary="健康检查（无需鉴权）")
 async def health():
-    """探活接口，供部署脚本/负载均衡使用。"""
+    """探活接口，供部署脚本/负载均衡使用，故意不挂鉴权。"""
     return {"status": "ok"}
 
 
-@app.post("/chat", summary="流式对话接口")
+@app.post(
+    "/chat",
+    summary="流式对话接口",
+    dependencies=[Depends(require_api_key)],
+)
 async def chat(payload: ChatRequest, model: ChatOpenAI = Depends(get_model)):
     # 1. 按轮数裁剪历史。history_len=0 表示一条历史都不带。
     keep = payload.history_len * 2

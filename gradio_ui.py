@@ -1,8 +1,23 @@
+"""Gradio 前端：聊天界面 + 参数面板。
+
+与后端的约定变化：现在每个请求都要带 X-API-Key 请求头，
+其值与后端 .env 里的 GATEWAY_API_KEY 相同。
+（前端和后端读的是同一个 .env，所以本地开发不用额外配置。）
+"""
+
+import os
+
 import gradio as gr
 import requests
+from dotenv import load_dotenv
 
-# 后端接口地址
-BACKEND_URL = "http://127.0.0.1:6066/chat"
+load_dotenv()
+
+# 后端接口地址（可用环境变量覆盖，方便部署时改）
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:6066/chat")
+
+# 调用后端所需的密钥
+API_KEY = os.getenv("GATEWAY_API_KEY", "")
 
 
 def chat_with_backend(prompt, history, sys_prompt, history_len, temperature, top_p, max_tokens, stream):
@@ -20,9 +35,27 @@ def chat_with_backend(prompt, history, sys_prompt, history_len, temperature, top
         "max_tokens": int(max_tokens)
     }
 
+    headers = {"X-API-Key": API_KEY}
+
     try:
-        response = requests.post(BACKEND_URL, json=data, stream=True, timeout=60)
-        response.raise_for_status()  # 请求失败直接抛出异常
+        response = requests.post(BACKEND_URL, json=data, headers=headers, stream=True, timeout=60)
+
+        # 鉴权失败 / 参数校验失败时后端返回的是 JSON，先拦下来，
+        # 否则会把一坨 JSON 当成"回复"显示在聊天框里。
+        if response.status_code == 401:
+            yield "❌ 鉴权失败：请检查 .env 里的 GATEWAY_API_KEY，前后端要一致"
+            return
+        if response.status_code == 422:
+            try:
+                yield f"❌ 参数校验未通过：{response.json().get('detail')}"
+            except ValueError:
+                yield f"❌ 参数校验未通过：{response.text}"
+            return
+        if response.status_code == 500 and "GATEWAY_API_KEY" in response.text:
+            yield "❌ 后端没配置 GATEWAY_API_KEY，请在 .env 里加上后重启后端"
+            return
+
+        response.raise_for_status()  # 其余 4xx/5xx 直接抛异常
 
         full_response = ""
         if stream:
@@ -56,9 +89,7 @@ with gr.Blocks(fill_height=True, fill_width=True) as demo:
 
         # 右侧聊天区域
         with gr.Column(scale=10):
-            # 删掉了 type="messages" 参数
             chatbot = gr.Chatbot(height=500)
-            # 删掉了 type="messages" 参数
             gr.ChatInterface(
                 fn=chat_with_backend,
                 chatbot=chatbot,
