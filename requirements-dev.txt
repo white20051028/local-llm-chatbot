@@ -1,0 +1,8 @@
+# 开发/测试依赖（运行时依赖见 requirements.txt）
+#
+# 安装：
+#   python -m pip install -r requirements-dev.txt
+# 运行测试：
+#   python -m pytest -q
+pytest
+httpx
