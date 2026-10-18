@@ -22,6 +22,31 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 Role = Literal["system", "user", "assistant"]
 
 
+def _extract_text(value: object) -> str:
+    """把各种「消息正文」形态统一抽成字符串。
+
+    起因：Gradio 6 的 ChatMessage.content 允许两种写法——
+    字符串，或者内容块数组 [{"type": "text", "text": "你好"}]（多模态用）。
+    它的前端聊天记录走的是后者，于是第一轮能聊、第二轮把 history 发上来
+    就全部 422。OpenAI 的 chat API 同样接受这两种写法，所以接口兼容它们
+    才是对的，不该强迫调用方改。
+
+    这里顺带兼容几种历史遗留形态（裸字符串数组、只带 text 键的 dict），
+    遇到无法识别的（比如只有文件路径）就返回空串，交给上层报"正文为空"。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content"):
+            inner = value.get(key)
+            if isinstance(inner, str):
+                return inner
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "".join(_extract_text(item) for item in value)
+    return ""
+
+
 class ChatMessage(BaseModel):
     """一条历史消息。"""
 
@@ -30,7 +55,21 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: Role = Field(..., description="只能是 system / user / assistant")
-    content: str = Field(..., min_length=1, max_length=8_000, description="消息正文")
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=8_000,
+        description='消息正文。可以是字符串，也可以是 [{"type":"text","text":"..."}] 形式的内容块数组',
+    )
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_content(cls, value: object) -> str:
+        """进模型之前先把 content 归一化成字符串。"""
+        text = _extract_text(value)
+        if not text.strip():
+            raise ValueError("content 不能为空（目前只支持文本消息）")
+        return text
 
 
 # /docs 里「Try it out」会预填这个示例。

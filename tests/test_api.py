@@ -214,3 +214,61 @@ def test_openapi里的示例请求体本身是合法的(client):
     # 端到端再确认一次：拿这份示例发请求，不该是 4xx
     r = client.post("/chat", json=EXAMPLE_REQUEST, headers=HEADERS)
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------- content 形态
+def test_content支持内容块数组(client, fake_model):
+    """Gradio 6 发上来的就是这种形状。
+
+    回归用：修之前，只要 history 里有一条，整轮对话就 422。
+    """
+    body = {
+        "query": "第二轮",
+        "history": [
+            {"role": "user", "content": [{"type": "text", "text": "你好"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "你好，有什么可以帮你？"}]},
+        ],
+    }
+    r = client.post("/chat", json=body, headers=HEADERS)
+    assert r.status_code == 200
+    # 归一化之后，发给模型的必须是纯字符串
+    assert [m["content"] for m in fake_model.messages] == [
+        "你是一个有用的助手",
+        "你好",
+        "你好，有什么可以帮你？",
+        "第二轮",
+    ]
+
+
+def test_content支持裸字符串数组(client, fake_model):
+    """Gradio 的多模态分支会往 content 数组里直接 append 字符串。"""
+    body = {"query": "二", "history": [{"role": "user", "content": ["你", "好"]}]}
+    r = client.post("/chat", json=body, headers=HEADERS)
+    assert r.status_code == 200
+    assert fake_model.messages[1]["content"] == "你好"
+
+
+def test_content支持只带text键的dict(client, fake_model):
+    body = {"query": "二", "history": [{"role": "user", "content": {"text": "你好"}}]}
+    r = client.post("/chat", json=body, headers=HEADERS)
+    assert r.status_code == 200
+    assert fake_model.messages[1]["content"] == "你好"
+
+
+def test_content为空数组被拒绝(client):
+    """抽不出文本时给一句人话，而不是 'Input should be a valid string'。"""
+    body = {"query": "二", "history": [{"role": "user", "content": []}]}
+    r = client.post("/chat", json=body, headers=HEADERS)
+    assert r.status_code == 422
+    assert "不能为空" in r.text
+
+
+def test_多轮对话_Gradio完整形状(client):
+    """模拟 Gradio 聊到第 4 轮时发上来的完整 history。"""
+    history = []
+    for turn in range(4):
+        history.append({"role": "user", "content": [{"type": "text", "text": f"问{turn}"}]})
+        history.append({"role": "assistant", "content": [{"type": "text", "text": f"答{turn}"}]})
+    body = {"query": "第五问", "history": history, "history_len": 4}
+    r = client.post("/chat", json=body, headers=HEADERS)
+    assert r.status_code == 200
