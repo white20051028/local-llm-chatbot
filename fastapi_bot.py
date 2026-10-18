@@ -12,7 +12,7 @@
 import os
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -48,11 +48,26 @@ app.add_middleware(
 #   ② 测试里可以把它换成假模型，不产生真实网络请求、不花钱。
 _model: ChatOpenAI | None = None
 
+# 三个必需的环境变量。缺任何一个都不能正常调用模型。
+MODEL_ENV_KEYS = ("SILICONFLOW_API_KEY", "SILICONFLOW_BASE_URL", "SILICONFLOW_MODEL")
+
 
 def get_model() -> ChatOpenAI:
-    """返回全局唯一的模型客户端（第一次调用时创建）。"""
+    """返回全局唯一的模型客户端（第一次调用时创建）。
+
+    这里要显式检查配置，而不是直接把 None 交给 ChatOpenAI：
+    少了配置时它抛的是 pydantic 的 ValidationError，日志里只有
+    "model Input should be a valid string"，完全看不出是 .env 没填。
+    换成一个说人话的 500，排查时间从半小时变成十秒。
+    """
     global _model
     if _model is None:
+        missing = [key for key in MODEL_ENV_KEYS if not os.getenv(key)]
+        if missing:
+            raise HTTPException(
+                status_code=500,
+                detail=f"服务端缺少配置：{', '.join(missing)}，请检查 .env 后重启服务",
+            )
         _model = ChatOpenAI(
             api_key=os.getenv("SILICONFLOW_API_KEY"),
             base_url=os.getenv("SILICONFLOW_BASE_URL"),

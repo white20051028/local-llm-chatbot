@@ -172,3 +172,24 @@ def test_history_len按轮数保留(client, fake_model):
     }
     client.post("/chat", json=body, headers=HEADERS)
     assert [m["role"] for m in fake_model.messages] == ["system", "user", "assistant", "user"]
+
+
+# ---------------------------------------------------------------- 配置缺失
+def test_模型配置缺失时返回可读的错误(client, monkeypatch):
+    """不走假模型，验证真实的 get_model 在缺配置时给的是人话，不是 pydantic 堆栈。
+
+    注意：这条会返回 500 而不是 422。因为 FastAPI 先解依赖、再校验请求体，
+    服务端连模型都没配好时，任何请求都应该先报"服务器配置有问题"。
+    这个顺序是刻意的——把 500 的文案做得足够清楚，比调整顺序更重要。
+    """
+    import fastapi_bot
+
+    app.dependency_overrides.pop(get_model, None)
+    monkeypatch.setattr(fastapi_bot, "_model", None)
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    monkeypatch.delenv("SILICONFLOW_MODEL", raising=False)
+    monkeypatch.delenv("SILICONFLOW_BASE_URL", raising=False)
+
+    r = client.post("/chat", json={}, headers=HEADERS)
+    assert r.status_code == 500
+    assert "SILICONFLOW" in r.json()["detail"]
