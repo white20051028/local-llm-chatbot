@@ -128,10 +128,14 @@ def get_model() -> ChatOpenAI:
                 status_code=500,
                 detail=f"服务端缺少配置：{', '.join(missing)}，请检查 .env 后重启服务",
             )
+        connect_timeout = float(os.getenv("LLM_CONNECT_TIMEOUT", "5"))
+        read_timeout = float(os.getenv("LLM_READ_TIMEOUT", "15"))
         _model = ChatOpenAI(
             api_key=os.getenv("SILICONFLOW_API_KEY"),
             base_url=os.getenv("SILICONFLOW_BASE_URL"),
             model=os.getenv("SILICONFLOW_MODEL"),
+            request_timeout=(connect_timeout, read_timeout), # 元组是(连接，读取)、
+            max_retries=0, # 关掉底层的隐式重试
         )
     return _model
 
