@@ -1,12 +1,14 @@
 """FastAPI 后端：流式对话接口。
 
-本 PR（feat/production-ready 第 1 步）做了三件事：
+本 PR（feat/production-ready）做了四件事：
 
 1. 请求体改用 Pydantic 模型（schemas.py）—— 非法请求在进入函数前就返回 422；
 2. 加 API Key 鉴权（auth.py）—— 只有带正确 X-API-Key 头的请求才放行；
 3. 顺手修掉一个 bug：原来 history_len=0（滑块最左=不保留历史）时，
    条件 `if history_len > 0 and ...` 不成立，反而把**全部**历史都带上了，
-   与界面上"0 = 不保留"的语义相反。
+   与界面上"0 = 不保留"的语义相反；
+4. 把 Swagger 资源本地化到 static/，让 /docs 不再依赖 jsdelivr
+   （原因见下面 app = FastAPI(...) 上方的注释）。
 """
 
 import os
@@ -15,7 +17,9 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
 
 from auth import require_api_key
@@ -24,13 +28,23 @@ from schemas import ChatRequest
 # 加载环境变量。必须在任何 os.getenv 之前执行。
 load_dotenv()
 
+# 用文件所在目录作为基准，这样不管从哪个目录启动都能找到 static/
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# docs_url / redoc_url 都设成 None，是因为下面要自己写 /docs 路由。
+#
+# 为什么必须自己写：
+#   ① FastAPI 0.143 已经**移除**了 swagger_js_url / swagger_css_url 这两个参数。
+#      而 FastAPI.__init__ 带 **extra，所以传进去既不报错、也不生效——
+#      默认仍然指向 cdn.jsdelivr.net。
+#   ② 那个域名在国内基本连不上，于是 /docs 的 HTML 能返回 200，
+#      但 Swagger 的 JS 永远加载不到，页面一片白。
+#   ③ 把资源放进本地 static/ 之后，断网也能打开文档，演示时不怕网络出问题。
 app = FastAPI(
     title="本地对话机器人 API",
     description="带鉴权的流式对话接口。所有 /chat 请求需要在 Header 里带上 X-API-Key。",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    swagger_js_url="https://cdn.bootcdn.net/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.min.js",
-    swagger_css_url="https://cdn.bootcdn.net/ajax/libs/swagger-ui/5.17.14/swagger-ui.min.css",
+    docs_url=None,
+    redoc_url=None,
 )
 
 # 允许跨域
@@ -41,6 +55,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 把 static/ 挂到 /static 下，供 /docs 页面加载本地的 swagger 资源
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui():
+    """自定义的接口文档页，资源全部走本地 /static，不依赖任何 CDN。"""
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - 接口文档",
+        swagger_js_url="/static/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui.css",
+        swagger_favicon_url="",
+    )
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """访问根路径直接跳到文档页，省得看到 {"detail":"Not Found"}。"""
+    return RedirectResponse(url="/docs")
+
 
 # 懒加载的模型客户端。
 # 不放在模块顶层直接构造，有两个原因：

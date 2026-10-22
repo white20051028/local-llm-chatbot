@@ -157,7 +157,10 @@ python -m pytest -q
 ├── tests/
 │   └── test_api.py       # 接口测试（pytest）
 ├── docs/
-│   └── TROUBLESHOOTING.md # 踩坑记录：六个真实故障的现象/根因/修法
+│   └── TROUBLESHOOTING.md # 踩坑记录：七个真实故障的现象/根因/修法
+├── static/               # 本地化的 swagger-ui 资源（/docs 不依赖 CDN）
+│   ├── swagger-ui-bundle.js
+│   └── swagger-ui.css
 ├── pytest.ini            # pytest 配置
 ├── requirements.txt      # 运行时依赖
 ├── requirements-dev.txt  # 开发/测试依赖
@@ -166,8 +169,10 @@ python -m pytest -q
 └── .gitignore
 ```
 
-> 这个项目从 demo 改成可用服务的过程中踩了六个坑（配置缺失被报成 500、文档示例自己不合法、Gradio 第二轮必 422……），
+> 这个项目从 demo 改成可用服务的过程中踩了七个坑（配置缺失被报成 500、文档示例自己不合法、Gradio 第二轮必 422、`/docs` 一片白……），
 > 每个坑的现象、排查过程、根因和修法都记在 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 里。
+>
+> `/docs` 的静态资源放在 `static/`，**不依赖任何 CDN**，断网也能打开接口文档。
 
 ## ⚙️ 切换模型/服务
 

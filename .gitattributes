@@ -1,0 +1,5 @@
+# 统一换行符，避免 Windows / macOS 之间来回改
+* text=auto eol=lf
+
+# 第三方压缩资源不做换行符转换（它们是单行的、近似二进制的文件）
+static/** -text

@@ -244,6 +244,57 @@ git -C . remote -v                             # remote 里 2 处命中
 
 ---
 
+## 坑 7：`/docs` 返回 200，页面却一片白
+
+**现象**
+浏览器打开 `http://127.0.0.1:6066/docs`，标签页转了一下，然后纯白，什么都不显示。
+控制台没有任何报错（因为用户看不到控制台）。
+
+**怎么查出来的**
+1. 先确认后端没死：`/docs` 返回 200、`/openapi.json` 返回 200 且能解析出 `['/health','/chat']`
+   —— 说明服务和路由都正常，问题在前端资源。
+2. 把 `/docs` 返回的 HTML 抓下来，看它引用了哪些外部资源：
+   ```
+   https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js
+   ```
+3. 但代码里写的是 `cdn.bootcdn.net` —— **对不上**。
+4. 检查 `FastAPI.__init__` 的签名：
+   ```python
+   "swagger_js_url" in inspect.signature(FastAPI.__init__).parameters   # False
+   ```
+
+**根因**：两层叠在一起。
+
+1. **FastAPI 0.143 已经移除了 `swagger_js_url` / `swagger_css_url` 两个参数**。
+   而 `FastAPI.__init__` 带 `**extra`，所以传进去**既不报错、也不生效**，被静默吞掉。
+2. 于是实际生效的是默认 CDN `cdn.jsdelivr.net`。那个域名在国内基本连不上，
+   Swagger 的 JS 永远加载不下来 —— HTML 是 200，页面却纯白。
+
+**修法**：把资源本地化，彻底不依赖任何 CDN。
+
+1. 下载 `swagger-ui-bundle.js` + `swagger-ui.css` 到 `static/`；
+2. `FastAPI(docs_url=None, redoc_url=None)` 关掉自带路由；
+3. `app.mount("/static", StaticFiles(directory=...))`，路径用 `__file__` 算绝对路径，
+   否则换个目录启动就找不到；
+4. 自己写 `/docs` 路由，调用 `get_swagger_ui_html(swagger_js_url="/static/...")`
+   —— 被删的只是 `FastAPI.__init__` 上的参数，这个函数本身仍然支持自定义；
+5. 顺手加 `/` → 307 跳 `/docs`，免得访问根路径看到 `{"detail":"Not Found"}`。
+
+**怎么验证**
+```
+GET /docs                         200   外部资源: 无（全部本地）
+GET /static/swagger-ui-bundle.js  200   Content-Type: application/javascript
+GET /static/swagger-ui.css        200   Content-Type: text/css; charset=utf-8
+GET /                             307   Location: /docs
+```
+
+**教训**
+**参数不报错，不等于参数生效。**
+框架升级会静默吞掉旧参数——遇到"配置改了没反应"，
+第一步永远是验证它到底有没有被用上，而不是继续改业务代码。
+
+---
+
 ## 环境备注
 
 | 项 | 版本 |
