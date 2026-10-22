@@ -35,3 +35,8 @@ desktop.ini
 # ===== 日志 =====
 *.log
 logs/
+
+# ===== 测试 =====
+.pytest_cache/
+.coverage
+htmlcov/
