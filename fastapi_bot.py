@@ -23,6 +23,12 @@ from langchain_openai import ChatOpenAI
 
 from auth import require_api_key
 from schemas import ChatRequest
+import asyncio
+import logging
+import openai
+
+# 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
+logger = logging.getLogger("uvicorn.error")
 
 # 加载环境变量。必须在任何 os.getenv 之前执行。
 load_dotenv()
@@ -128,19 +134,70 @@ def get_model() -> ChatOpenAI:
                 status_code=500,
                 detail=f"服务端缺少配置：{', '.join(missing)}，请检查 .env 后重启服务",
             )
+        connect_timeout = float(os.getenv("LLM_CONNECT_TIMEOUT", "5"))
+        read_timeout = float(os.getenv("LLM_READ_TIMEOUT", "15"))
         _model = ChatOpenAI(
             api_key=os.getenv("SILICONFLOW_API_KEY"),
             base_url=os.getenv("SILICONFLOW_BASE_URL"),
             model=os.getenv("SILICONFLOW_MODEL"),
+            request_timeout=(connect_timeout, read_timeout), # 元组是(连接，读取)、
+            max_retries=0, # 关掉底层的隐式重试
         )
     return _model
 
-
+# 这里加了个配置回显，以后一条名了就可以看出服务到底在和谁说话 curl.exe -s http://127.0.0.1:6066/health
 @app.get("/health", summary="健康检查（无需鉴权）")
 async def health():
-    """探活接口，供部署脚本/负载均衡使用，故意不挂鉴权。"""
-    return {"status": "ok"}
+    """探活接口。顺便回显当前生效的配置，避免"改了没生效"的排查成本。"""
+    return {
+        "status": "ok",
+        "model": os.getenv("SILICONFLOW_MODEL"),
+        "base_url": os.getenv("SILICONFLOW_BASE_URL"),
+        "timeout": f"{os.getenv('LLM_CONNECT_TIMEOUT', '5')}/{os.getenv('LLM_READ_TIMEOUT', '15')}",
+    }
 
+def _is_retryable(exc: Exception) -> bool:
+    """判断这个异常值不值得重试。
+
+    判据不是"出错了"，而是"再试一次有可能成功"：
+      - 网络层问题（连不上、超时）     → 值得
+      - 429 限流                      → 值得（等一会儿再来）
+      - 5xx                           → 值得（对方临时故障）
+      - 400/401/403/404/422           → 不值得（我们的请求本身有问题，试一百次也一样）
+    """
+    # APITimeoutError 是 APIConnectionError 的子类，所以这一条同时覆盖"超时"和"连不上"
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        return exc.status_code == 429 or exc.status_code >= 500
+    return False
+
+async def _open_stream(bound, messages):
+    """打开上游流并返回 (stream, 第一个有内容的 chunk)。
+
+    失败时先判断错误类型：可重试的按指数退避重试，不可重试的直接抛。
+    """
+    max_attempts = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        stream = bound.astream(messages)      # 每次重试都要新建一个流
+        try:
+            async for chunk in stream:
+                if chunk.content:
+                    return stream, chunk
+        except Exception as e:
+            if not _is_retryable(e) or attempt == max_attempts:
+                raise
+            last_error = e
+            backoff = 2 ** (attempt - 1)      # 1s, 2s, 4s...
+            logger.warning(
+                "上游失败（第 %d/%d 次，%s），%d 秒后重试",
+                attempt, max_attempts, type(e).__name__, backoff,
+            )
+            await asyncio.sleep(backoff)
+
+    raise last_error if last_error else RuntimeError("上游没有返回任何内容")
 
 @app.post("/chat", summary="流式对话接口", dependencies=[Depends(require_api_key)])
 async def chat(payload: ChatRequest, model: ChatOpenAI = Depends(get_model)):
@@ -166,9 +223,18 @@ async def chat(payload: ChatRequest, model: ChatOpenAI = Depends(get_model)):
         max_tokens=payload.max_tokens,
     )
 
-    # 4. 异步流式生成
+    # 4. 先连上游、拿到第一个 chunk。
+    #    关键：失败必须发生在这里（还没返回响应），而不是在流开始之后。
+
+    try:
+        stream, first_chunk = await _open_stream(bound, messages)
+    except Exception as e:
+        logger.exception("调用上游失败")   # ← 加这行
+        raise HTTPException(status_code=502, detail=f"上游模型服务不可用：{type(e).__name__}")
+
     async def generate_response():
-        async for chunk in bound.astream(messages):
+        yield first_chunk.content
+        async for chunk in stream:
             if chunk.content:
                 yield chunk.content
 
