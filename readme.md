@@ -198,6 +198,55 @@ python tools/measure_retry.py            # 一条命令，自带假上游
 
 输出会打印**实际尝试次数**、**总耗时**，以及理论值。两者差得多就说明配置或代码有问题。
 
+### 演练记录（真实运行输出）
+
+**① 正常情况**
+
+```console
+$ curl.exe -s http://127.0.0.1:6066/health
+{"status":"ok","model":"Qwen/Qwen2.5-7B-Instruct","base_url":"https://api.siliconflow.cn/v1","timeout":"5/15"}
+
+$ python tools/probe_failure.py
+目标: http://127.0.0.1:6066/chat
+  HTTP 状态 : 200
+  耗时      : 1.63 秒
+  响应内容  : '你好！很高兴为你提供帮助。有什么问题或需要咨询的内容吗？'
+```
+
+**② 上游挂掉**（把 `base_url` 指向一个只接受连接、永不响应的假上游）
+
+```console
+$ python tools/probe_failure.py
+目标: http://127.0.0.1:6066/chat
+  HTTP 状态 : 502  ← 客户端拿到了明确错误
+  耗时      : 48.23 秒
+  响应内容  : '{"detail":"上游模型服务不可用：OpenAITimeoutError"}'
+```
+
+服务端日志（每次重试都留痕）：
+
+```console
+WARNING:  上游失败（第 1/3 次，OpenAITimeoutError），1 秒后重试
+WARNING:  上游失败（第 2/3 次，OpenAITimeoutError），2 秒后重试
+ERROR:    调用上游失败
+Traceback (most recent call last):
+  ...
+openai.APITimeoutError: Request timed out.
+INFO:     127.0.0.1:56331 - "POST /chat HTTP/1.1" 502 Bad Gateway
+```
+
+**③ 恢复**（改回真实地址）
+
+```console
+$ python tools/probe_failure.py
+  HTTP 状态 : 200
+  耗时      : 1.58 秒
+  响应内容  : '你好！有什么我可以帮你的吗？'
+```
+
+> 三个数字对照着看：**改前是 `200` + 空内容 + 无限等待；改后是 `502` + 明确原因 + 48 秒封顶；
+> 而恢复之后，流式体验没有任何变化。**
+
 ## 📂 项目结构
 
 ```
