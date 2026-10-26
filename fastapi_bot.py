@@ -26,6 +26,7 @@ from schemas import ChatRequest
 import asyncio
 import logging
 import openai
+from providers import load_providers
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -104,55 +105,70 @@ async def on_request_validation_error(request: Request, exc: RequestValidationEr
     return JSONResponse(status_code=422, content={"detail": details})
 
 
-# 三个必需的环境变量，缺任何一个都调不动模型。
-MODEL_ENV_KEYS = ("SILICONFLOW_API_KEY", "SILICONFLOW_BASE_URL", "SILICONFLOW_MODEL")
+# 启动时加载一次。配置有问题会在这里直接报错、服务起不来——这是对的，
+# 总比运行到第一个请求时才炸好。
+_PROVIDERS, DEFAULT_PROVIDER = load_providers(
+    os.path.join(BASE_DIR, "providers.toml")
+)
 
-_model: ChatOpenAI | None = None
+# 启动时把注册表打出来。
+# 为什么需要这行：uvicorn 的 --reload 只监听 .py，不监听 .toml，
+# 所以改完 providers.toml 必须手动重启；没有这行日志，你没法确认"新后端进来了没"。
+logger.info(
+    "已加载 %d 个模型后端（默认 %s）：%s",
+    len(_PROVIDERS),
+    DEFAULT_PROVIDER,
+    "、".join(_PROVIDERS),
+)
+
+# 按 provider 名字缓存 client：每个后端只建一次（内部有连接池），之后复用。
+_clients: dict[str, ChatOpenAI] = {}
 
 
-def get_model() -> ChatOpenAI:
-    """懒加载模型客户端：第一次真正要用的时候才创建。
+def get_model(provider: str | None = None) -> ChatOpenAI:
+    """按名字取模型客户端；不传就用默认 provider。"""
+    name = provider or DEFAULT_PROVIDER
 
-    为什么不写成模块级的 `chat_model = ChatOpenAI(...)`：
+    cfg = _PROVIDERS.get(name)
+    if cfg is None:
+        # 客户端传了一个不存在的名字 —— 这是客户端的错，所以是 400 不是 500
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知的 provider：{name!r}；可用的有：{list(_PROVIDERS)}",
+        )
 
-    ① 模块级写法在 import 阶段就会执行。只要 .env 少配一个变量，
-       它会在启动时抛 pydantic 的 ValidationError：
-           model
-             Input should be a valid string [input_value=None]
-       服务直接起不来，而且这行报错完全看不出是"你忘了填 .env"。
-
-    ② 作为 FastAPI 依赖，测试里可以用 app.dependency_overrides 换成假模型，
-       一个请求都不会发到网上，也不花钱。
-    """
-    global _model
-    if _model is None:
-        missing = [key for key in MODEL_ENV_KEYS if not os.getenv(key)]
-        if missing:
-            # 说人话的 500：把"缺哪个变量"直接写在响应里，
-            # 排查时间从半小时变成十秒。
+    if name not in _clients:
+        if cfg.api_key_env and not os.getenv(cfg.api_key_env):
             raise HTTPException(
                 status_code=500,
-                detail=f"服务端缺少配置：{', '.join(missing)}，请检查 .env 后重启服务",
+                detail=f"provider '{cfg.name}' 需要环境变量 {cfg.api_key_env}，请检查 .env",
             )
         connect_timeout = float(os.getenv("LLM_CONNECT_TIMEOUT", "5"))
         read_timeout = float(os.getenv("LLM_READ_TIMEOUT", "15"))
-        _model = ChatOpenAI(
-            api_key=os.getenv("SILICONFLOW_API_KEY"),
-            base_url=os.getenv("SILICONFLOW_BASE_URL"),
-            model=os.getenv("SILICONFLOW_MODEL"),
-            request_timeout=(connect_timeout, read_timeout), # 元组是(连接，读取)、
-            max_retries=0, # 关掉底层的隐式重试
+        _clients[name] = ChatOpenAI(
+            api_key=os.getenv(cfg.api_key_env) if cfg.api_key_env else "not-needed",
+            base_url=cfg.base_url,
+            model=cfg.model,
+            request_timeout=(connect_timeout, read_timeout),
+            max_retries=0,
         )
-    return _model
+
+    return _clients[name]
 
 # 这里加了个配置回显，以后一条名了就可以看出服务到底在和谁说话 curl.exe -s http://127.0.0.1:6066/health
 @app.get("/health", summary="健康检查（无需鉴权）")
 async def health():
-    """探活接口。顺便回显当前生效的配置，避免"改了没生效"的排查成本。"""
+    """探活接口。回显当前生效的后端与模型，避免"改了没生效"的排查成本。
+
+    故意不回显 base_url：这个接口**免鉴权**，而 base_url 可能指向内网地址
+    （本地 Ollama 是 127.0.0.1，公司内网可能是 10.x），等于对外泄露拓扑。
+    需要看 base_url 时去启动日志或需要鉴权的 /providers 拿。
+    """
+    cfg = _PROVIDERS[DEFAULT_PROVIDER]
     return {
         "status": "ok",
-        "model": os.getenv("SILICONFLOW_MODEL"),
-        "base_url": os.getenv("SILICONFLOW_BASE_URL"),
+        "provider": cfg.name,
+        "model": cfg.model,
         "timeout": f"{os.getenv('LLM_CONNECT_TIMEOUT', '5')}/{os.getenv('LLM_READ_TIMEOUT', '15')}",
     }
 
@@ -199,8 +215,26 @@ async def _open_stream(bound, messages):
 
     raise last_error if last_error else RuntimeError("上游没有返回任何内容")
 
+@app.get(
+    "/providers",
+    summary="列出可用的模型后端",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_providers():
+    """给前端用：告诉它有哪些后端可选、默认是哪个。
+
+    故意不回传 base_url 和 api_key_env：
+    前者可能是内网地址，后者是内部实现细节。
+    """
+    return {
+        "default": DEFAULT_PROVIDER,
+        "providers": [
+            {"name": cfg.name, "model": cfg.model}
+            for cfg in _PROVIDERS.values()
+        ],
+    }
 @app.post("/chat", summary="流式对话接口", dependencies=[Depends(require_api_key)])
-async def chat(payload: ChatRequest, model: ChatOpenAI = Depends(get_model)):
+async def chat(payload: ChatRequest):
     # 1. 按轮数裁剪历史。history_len=0 表示一条历史都不带。
     #    原代码写的是 `if history_len > 0 and len(history) > history_len*2`，
     #    history_len=0 时整个条件为假、直接跳过裁剪，反而把全部历史都带上了，
@@ -216,14 +250,20 @@ async def chat(payload: ChatRequest, model: ChatOpenAI = Depends(get_model)):
     messages.extend(msg.model_dump() for msg in history)
     messages.append({"role": "user", "content": payload.query})
 
-    # 3. 绑定本次请求的采样参数
+    # 3. 取本次请求要用的后端（不传就用默认）
+    #    先算出名字，后面要拿它回传 X-Provider；get_model 会校验名字合不合法。
+    provider_name = payload.provider or DEFAULT_PROVIDER
+    model = get_model(provider_name)
+    cfg = _PROVIDERS[provider_name]
+
+    # 4. 绑定本次请求的采样参数
     bound = model.bind(
         temperature=payload.temperature,
         top_p=payload.top_p,
         max_tokens=payload.max_tokens,
     )
 
-    # 4. 先连上游、拿到第一个 chunk。
+    # 5. 先连上游、拿到第一个 chunk。
     #    关键：失败必须发生在这里（还没返回响应），而不是在流开始之后。
 
     try:
@@ -239,9 +279,12 @@ async def chat(payload: ChatRequest, model: ChatOpenAI = Depends(get_model)):
                 yield chunk.content
 
     # charset 要显式写：只写 text/plain 时，某些客户端会按 latin-1 解码，中文变乱码。
+    # X-Provider / X-Model 让调用方一眼看出这次是谁服务的——
+    # 排查"到底切没切成功"全靠它，否则只能靠猜。
     return StreamingResponse(
         generate_response(),
         media_type="text/plain; charset=utf-8",
+        headers={"X-Provider": cfg.name, "X-Model": cfg.model},
     )
 
 

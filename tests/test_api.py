@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-
+from fastapi import HTTPException
 import auth
 import fastapi_bot
 from fastapi_bot import app, get_model
@@ -22,6 +22,7 @@ from fastapi_bot import app, get_model
 import httpx
 import openai
 
+_REAL_GET_MODEL = fastapi_bot.get_model
 TEST_KEY = "test-key-0000"
 HEADERS = {"X-API-Key": TEST_KEY}
 
@@ -66,11 +67,9 @@ def fake_model():
 def _patch(monkeypatch, fake_model):
     # 鉴权用的是模块级常量，直接改掉它，测试就不依赖 .env
     monkeypatch.setattr(auth, "API_KEY", TEST_KEY)
-    # 用依赖覆盖把真模型换成假模型：一个请求都不会发到网上去
-    app.dependency_overrides[get_model] = lambda: fake_model
+    # 路由现在直接调用 get_model()，不再经过 Depends，
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: fake_model)
     yield
-    app.dependency_overrides.clear()
-
 
 @pytest.fixture
 def client():
@@ -85,12 +84,27 @@ def test_health_无需鉴权(client):
     body = r.json()
     assert body["status"] == "ok"
     # 配置回显：只断言字段存在，不断言具体值（值随 .env 变化）
-    for key in ("model", "base_url", "timeout"):
+    for key in ("provider", "model", "timeout"):
         assert key in body
+
+    # /health 免鉴权，绝不能回显 base_url（可能指向内网地址）
+    assert "base_url" not in body
 
     # 安全：绝对不能把 API Key 回显出去
     assert "sk-" not in r.text
 
+def test_非ASCII的key返回401(client):
+    """Header 是客户端可控的，可能带任意字节 —— 不能因为编码问题变成 500。
+
+    用 bytes 而不是 str 传：httpx 会先把非 ASCII 的 str 拒掉，
+    这样测的就不是服务端了。真实客户端（curl/浏览器）不会拦。
+    """
+    r = client.post(
+        "/chat",
+        json={"query": "hi"},
+        headers={"X-API-Key": "中文密钥".encode("utf-8")},
+    )
+    assert r.status_code == 401
 
 def test_缺少_api_key_返回401(client):
     r = client.post("/chat", json={"query": "你好"})
@@ -202,25 +216,16 @@ def test_history_len按轮数保留(client, fake_model):
 
 
 # ---------------------------------------------------------------- 配置缺失
-def test_模型配置缺失时返回可读的错误(client, monkeypatch):
-    """不走假模型，验证真实的 get_model 在缺配置时给的是人话，不是 pydantic 堆栈。
-
-    注意：这条会返回 500 而不是 422。因为 FastAPI 先解依赖、再校验请求体，
-    服务端连模型都没配好时，任何请求都应该先报"服务器配置有问题"。
-    这个顺序是刻意的——把 500 的文案做得足够清楚，比调整顺序更重要。
-    """
-
-    app.dependency_overrides.pop(get_model, None)
-    monkeypatch.setattr(fastapi_bot, "_model", None)
+def test_模型配置缺失时返回可读的错误(monkeypatch):
+    """不走假模型，直接验真实的 get_model 在缺 key 时给的是人话。"""
+    fastapi_bot._clients.clear()
     monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
-    monkeypatch.delenv("SILICONFLOW_MODEL", raising=False)
-    monkeypatch.delenv("SILICONFLOW_BASE_URL", raising=False)
 
-    r = client.post("/chat", json={}, headers=HEADERS)
-    assert r.status_code == 500
-    assert "SILICONFLOW" in r.json()["detail"]
+    with pytest.raises(HTTPException) as excinfo:
+        _REAL_GET_MODEL("siliconflow")
 
-
+    assert excinfo.value.status_code == 500
+    assert "SILICONFLOW_API_KEY" in excinfo.value.detail
 # ---------------------------------------------------------------- 文档示例
 def test_openapi里的示例请求体本身是合法的(client):
     """文档示例必须能通过校验。
@@ -330,11 +335,11 @@ def fast_retry(monkeypatch):
     monkeypatch.setattr(fastapi_bot.asyncio, "sleep", _no_sleep)
     monkeypatch.setenv("LLM_MAX_ATTEMPTS", "3")
 
-
-def test_上游超时返回502(client, fast_retry):
+# 第 334 行：加一个参数
+def test_上游超时返回502(client, fast_retry, monkeypatch):
     """超时是可重试错误：试满 3 次仍失败，才返回 502。"""
     boom = BoomModel(openai.APITimeoutError(request=_fake_request()))
-    app.dependency_overrides[get_model] = lambda: boom
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
 
     r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
 
@@ -343,7 +348,7 @@ def test_上游超时返回502(client, fast_retry):
     assert boom.calls == 3
 
 
-def test_400错误不重试(client, fast_retry):
+def test_400错误不重试(client, fast_retry, monkeypatch):
     """参数错误重试一百次也一样，必须只调用一次。"""
     exc = openai.BadRequestError(
         "bad request",
@@ -351,9 +356,91 @@ def test_400错误不重试(client, fast_retry):
         body=None,
     )
     boom = BoomModel(exc)
-    app.dependency_overrides[get_model] = lambda: boom
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
 
     r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
 
     assert r.status_code == 502
     assert boom.calls == 1
+
+# ---------------------------------------------------------------- 多后端
+def test_providers接口列出可选后端(client):
+    r = client.get("/providers", headers=HEADERS)
+    assert r.status_code == 200
+
+    body = r.json()
+    assert body["default"] == "siliconflow"
+
+    names = [p["name"] for p in body["providers"]]
+    assert "siliconflow" in names
+    assert "ollama" in names
+
+    # 敏感/内部字段不能回传
+    assert "base_url" not in body["providers"][0]
+    assert "api_key_env" not in body["providers"][0]
+
+
+def test_providers接口需要鉴权(client):
+    assert client.get("/providers").status_code == 401
+
+
+def test_health回显当前provider(client):
+    assert client.get("/health").json()["provider"] == "siliconflow"
+
+
+def test_请求可指定provider(client, monkeypatch, fake_model):
+    """客户端传了 provider，路由要把它原样交给 get_model。"""
+    seen = []
+
+    def fake_get_model(provider=None):
+        seen.append(provider)
+        return fake_model
+
+    monkeypatch.setattr(fastapi_bot, "get_model", fake_get_model)
+
+    r = client.post(
+        "/chat", json={"query": "hi", "provider": "ollama"}, headers=HEADERS
+    )
+    assert r.status_code == 200
+    assert seen == ["ollama"]
+
+
+def test_不传provider时用默认名字(client, monkeypatch, fake_model):
+    """默认值现在在路由层解析：路由先把 None 换成默认名字，再交给 get_model。
+
+    为什么改到路由层：路由自己也要知道"用的是谁"，才能回传 X-Provider 响应头。
+    """
+    seen = []
+
+    def fake_get_model(provider=None):
+        seen.append(provider)
+        return fake_model
+
+    monkeypatch.setattr(fastapi_bot, "get_model", fake_get_model)
+
+    client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+    assert seen == [fastapi_bot.DEFAULT_PROVIDER]
+
+
+def test_未知provider抛400():
+    """名字不在注册表里 = 客户端传错了，400 而不是 500。"""
+    with pytest.raises(HTTPException) as excinfo:
+        _REAL_GET_MODEL("不存在的后端")
+
+    assert excinfo.value.status_code == 400
+    assert "不存在的后端" in excinfo.value.detail
+
+def test_响应头标明实际使用的后端(client):
+    """让调用方能看出这次是谁服务的——否则"切没切成功"只能靠猜。"""
+    cfg = fastapi_bot._PROVIDERS[fastapi_bot.DEFAULT_PROVIDER]
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+    assert r.headers["X-Provider"] == cfg.name
+    assert r.headers["X-Model"] == cfg.model
+
+
+def test_响应头跟随指定的provider(client):
+    r = client.post(
+        "/chat", json={"query": "hi", "provider": "ollama"}, headers=HEADERS
+    )
+    assert r.headers["X-Provider"] == "ollama"
+    assert r.headers["X-Model"] == fastapi_bot._PROVIDERS["ollama"].model

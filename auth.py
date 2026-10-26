@@ -52,7 +52,11 @@ def require_api_key(
     #    故意不区分"没带"和"带错"，不给攻击者额外信息。
     #    用 compare_digest 而不是 ==：== 比到第一个不同的字符就返回，
     #    攻击者能靠测响应时间一个字符一个字符地猜（timing side-channel）。
-    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
+    # Header 是客户端可控的，可能带非 ASCII 字符（比如中文），
+    # 而 compare_digest 不接受非 ASCII 的 str —— 先转成 bytes 再比。
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key.encode("utf-8"), API_KEY.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效的 API Key",

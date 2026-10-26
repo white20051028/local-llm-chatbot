@@ -258,13 +258,17 @@ $ python tools/probe_failure.py
 ├── fastapi_bot.py        # 后端：路由、模型客户端、异常处理
 ├── schemas.py            # 请求体模型（Pydantic），负责字段与上下界校验
 ├── auth.py               # API Key 鉴权依赖
+├── providers.toml        # 模型后端注册表（结构在此，密钥在 .env）
+├── providers.py          # 读取并校验 providers.toml
 ├── gradio_ui.py          # 前端：Gradio 聊天界面与参数面板
 ├── tests/
-│   └── test_api.py       # 接口测试（pytest，25 条）
+│   └── test_api.py       # 接口测试（pytest，34 条）
 ├── tools/                # 手工排错与验证脚本（不参与自动测试）
 │   ├── smoke.py                # 校验层冒烟测试
 │   ├── smoke_auth.py           # 鉴权层冒烟测试
 │   ├── check_schema.py         # schema 约束自检
+│   ├── check_providers.py      # providers 加载器自检
+│   ├── show_providers.py       # 打印解析后的后端配置
 │   ├── probe_failure.py        # 打一次 /chat，打印状态码/耗时/响应体
 │   ├── silent_upstream.py      # 假上游：接受连接但永不响应
 │   ├── measure_model_timeout.py # 测模型层多久放弃
@@ -289,12 +293,78 @@ $ python tools/probe_failure.py
 >
 > `/docs` 的静态资源放在 `static/`，**不依赖任何 CDN**，断网也能打开接口文档。
 
-## ⚙️ 切换模型/服务
+## ⚙️ 多后端：加一个、切一个
 
-由于走的是 OpenAI 兼容协议，切换模型只需要改 `.env`：
-- **本地 Ollama**：`SILICONFLOW_BASE_URL=http://localhost:11434/v1`，`SILICONFLOW_MODEL=qwen2.5:7b`
-- **vLLM 自建服务**：指向你的 vLLM 地址即可
-- **其他 OpenAI 兼容服务**：填入对应地址与模型名
+后端列表在 **`providers.toml`**，不在 `.env` 里。密钥仍然在 `.env`（文件里只存变量名）。
+
+```toml
+default = "siliconflow"
+
+[providers.siliconflow]
+base_url = "https://api.siliconflow.cn/v1"
+model = "Qwen/Qwen2.5-7B-Instruct"
+api_key_env = "SILICONFLOW_API_KEY"     # 密钥所在的 .env 变量名
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen2.5:0.5b"
+api_key_env = ""                         # 本地服务不校验 key
+```
+
+**加一个新后端** = 加一段 `[providers.xxx]` + 在 `.env` 里补对应的 key，重启即可。
+
+> ⚠️ **改完 `providers.toml` 必须手动重启服务。** uvicorn 的 `--reload` 只监听 `.py`，
+> 不监听 `.toml`——你以为新配置生效了，其实服务内存里还是旧表，现象是"新加的后端在
+> `/providers` 里查不到"。
+> 重启后启动日志会打印 `已加载 N 个模型后端：...`，用它确认新后端真的进来了。
+
+**切一个** 有两种方式：
+
+```bash
+# ① 改默认值：改 providers.toml 里的 default，重启
+# ② 单次请求指定（不改默认）：
+curl -X POST http://127.0.0.1:6066/chat \
+  -H "X-API-Key: $GATEWAY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"query": "你好", "provider": "ollama"}'
+```
+
+看看有哪些可用：
+
+```bash
+curl http://127.0.0.1:6066/providers -H "X-API-Key: $GATEWAY_API_KEY"
+```
+
+### 为什么不支持"客户端自己传 base_url"
+
+一个看起来更灵活的设计是让请求带上任意地址。**那是一个 SSRF 漏洞**：客户端可以让你的服务器去访问任意内网地址（例如云厂商元数据 `169.254.169.254`）。
+
+所以这里只接受 **provider 名字**，真实 URL 由服务端配置决定。想接一个新后端，正确做法是让管理员改 `providers.toml`，而不是让终端用户传 URL。
+
+### 每次响应都标明是谁服务的
+
+响应头里带 `X-Provider` 和 `X-Model`，不用猜"到底切没切成功"：
+
+```bash
+curl -i -s -X POST http://127.0.0.1:6066/chat \
+  -H "X-API-Key: $GATEWAY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"query": "你好", "provider": "ollama"}' | head -5
+
+# HTTP/1.1 200 OK
+# x-provider: ollama
+# x-model: qwen2.5:0.5b
+```
+
+### 实测记录
+
+两个后端都真实跑通过（不是假模型）：
+
+| 请求 | X-Provider | X-Model | 耗时 | 返回内容 |
+|---|---|---|---|---|
+| 不传 `provider` | `siliconflow` | `Qwen/Qwen2.5-7B-Instruct` | 3.69s | "我是一个来自阿里云的语言模型，名叫通义千问…" |
+| `provider: "ollama"` | `ollama` | `qwen2.5:0.5b` | 4.08s | "我是一个AI助手，可以回答各种问题。" |
+| `provider: "不存在的"` | — | — | — | `400 未知的 provider：'不存在的'；可用的有：['siliconflow', 'ollama']` |
+
+第一行来自云端 7B，第二行来自本机 0.5B——**两条完全不同的链路，同一个接口**。
 
 ## ❓ 常见问题
 

@@ -83,6 +83,9 @@ class ChatMessage(BaseModel):
 EXAMPLE_REQUEST = {
     "query": "用一句话解释什么是 RAG",
     "sys_prompt": "你是一个简洁的助手",
+    # provider 一定要出现在示例里：Swagger 的 Example Value 用的是这个手写对象，
+    # 不加的话，打开 /docs 的人根本不知道有这个字段（字段在，但示例里看不见）。
+    "provider": "siliconflow",
     "history": [
         {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "你好，有什么可以帮你？"},
@@ -105,7 +108,11 @@ class ChatRequest(BaseModel):
         extra="forbid",
         json_schema_extra={"example": EXAMPLE_REQUEST},
     )
-
+    
+    provider: str | None = Field(
+        None,
+        description="用哪个后端；不传则用服务端的默认 provider",
+    )
     query: str = Field(..., min_length=1, max_length=8_000, description="用户本轮输入")
     sys_prompt: str = Field(
         "你是一个有用的助手", min_length=1, max_length=2_000, description="系统提示词"
