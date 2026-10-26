@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-
+from fastapi import HTTPException
 import auth
 import fastapi_bot
 from fastapi_bot import app, get_model
@@ -22,6 +22,7 @@ from fastapi_bot import app, get_model
 import httpx
 import openai
 
+_REAL_GET_MODEL = fastapi_bot.get_model
 TEST_KEY = "test-key-0000"
 HEADERS = {"X-API-Key": TEST_KEY}
 
@@ -66,11 +67,9 @@ def fake_model():
 def _patch(monkeypatch, fake_model):
     # 鉴权用的是模块级常量，直接改掉它，测试就不依赖 .env
     monkeypatch.setattr(auth, "API_KEY", TEST_KEY)
-    # 用依赖覆盖把真模型换成假模型：一个请求都不会发到网上去
-    app.dependency_overrides[get_model] = lambda: fake_model
+    # 路由现在直接调用 get_model()，不再经过 Depends，
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: fake_model)
     yield
-    app.dependency_overrides.clear()
-
 
 @pytest.fixture
 def client():
@@ -202,25 +201,16 @@ def test_history_len按轮数保留(client, fake_model):
 
 
 # ---------------------------------------------------------------- 配置缺失
-def test_模型配置缺失时返回可读的错误(client, monkeypatch):
-    """不走假模型，验证真实的 get_model 在缺配置时给的是人话，不是 pydantic 堆栈。
-
-    注意：这条会返回 500 而不是 422。因为 FastAPI 先解依赖、再校验请求体，
-    服务端连模型都没配好时，任何请求都应该先报"服务器配置有问题"。
-    这个顺序是刻意的——把 500 的文案做得足够清楚，比调整顺序更重要。
-    """
-
-    app.dependency_overrides.pop(get_model, None)
-    monkeypatch.setattr(fastapi_bot, "_model", None)
+def test_模型配置缺失时返回可读的错误(monkeypatch):
+    """不走假模型，直接验真实的 get_model 在缺 key 时给的是人话。"""
+    fastapi_bot._clients.clear()
     monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
-    monkeypatch.delenv("SILICONFLOW_MODEL", raising=False)
-    monkeypatch.delenv("SILICONFLOW_BASE_URL", raising=False)
 
-    r = client.post("/chat", json={}, headers=HEADERS)
-    assert r.status_code == 500
-    assert "SILICONFLOW" in r.json()["detail"]
+    with pytest.raises(HTTPException) as excinfo:
+        _REAL_GET_MODEL("siliconflow")
 
-
+    assert excinfo.value.status_code == 500
+    assert "SILICONFLOW_API_KEY" in excinfo.value.detail
 # ---------------------------------------------------------------- 文档示例
 def test_openapi里的示例请求体本身是合法的(client):
     """文档示例必须能通过校验。
@@ -330,11 +320,11 @@ def fast_retry(monkeypatch):
     monkeypatch.setattr(fastapi_bot.asyncio, "sleep", _no_sleep)
     monkeypatch.setenv("LLM_MAX_ATTEMPTS", "3")
 
-
-def test_上游超时返回502(client, fast_retry):
+# 第 334 行：加一个参数
+def test_上游超时返回502(client, fast_retry, monkeypatch):
     """超时是可重试错误：试满 3 次仍失败，才返回 502。"""
     boom = BoomModel(openai.APITimeoutError(request=_fake_request()))
-    app.dependency_overrides[get_model] = lambda: boom
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
 
     r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
 
@@ -343,7 +333,7 @@ def test_上游超时返回502(client, fast_retry):
     assert boom.calls == 3
 
 
-def test_400错误不重试(client, fast_retry):
+def test_400错误不重试(client, fast_retry, monkeypatch):
     """参数错误重试一百次也一样，必须只调用一次。"""
     exc = openai.BadRequestError(
         "bad request",
@@ -351,7 +341,7 @@ def test_400错误不重试(client, fast_retry):
         body=None,
     )
     boom = BoomModel(exc)
-    app.dependency_overrides[get_model] = lambda: boom
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
 
     r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
 
