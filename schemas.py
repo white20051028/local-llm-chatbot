@@ -83,6 +83,9 @@ class ChatMessage(BaseModel):
 EXAMPLE_REQUEST = {
     "query": "用一句话解释什么是 RAG",
     "sys_prompt": "你是一个简洁的助手",
+    # provider 一定要出现在示例里：Swagger 的 Example Value 用的是这个手写对象，
+    # 不加的话，打开 /docs 的人根本不知道有这个字段（字段在，但示例里看不见）。
+    "provider": "siliconflow",
     "history": [
         {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "你好，有什么可以帮你？"},
