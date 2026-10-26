@@ -105,11 +105,20 @@ async def on_request_validation_error(request: Request, exc: RequestValidationEr
     return JSONResponse(status_code=422, content={"detail": details})
 
 
-# 三个必需的环境变量，缺任何一个都调不动模型。
 # 启动时加载一次。配置有问题会在这里直接报错、服务起不来——这是对的，
 # 总比运行到第一个请求时才炸好。
 _PROVIDERS, DEFAULT_PROVIDER = load_providers(
     os.path.join(BASE_DIR, "providers.toml")
+)
+
+# 启动时把注册表打出来。
+# 为什么需要这行：uvicorn 的 --reload 只监听 .py，不监听 .toml，
+# 所以改完 providers.toml 必须手动重启；没有这行日志，你没法确认"新后端进来了没"。
+logger.info(
+    "已加载 %d 个模型后端（默认 %s）：%s",
+    len(_PROVIDERS),
+    DEFAULT_PROVIDER,
+    "、".join(_PROVIDERS),
 )
 
 # 按 provider 名字缓存 client：每个后端只建一次（内部有连接池），之后复用。
