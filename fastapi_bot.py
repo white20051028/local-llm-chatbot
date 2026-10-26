@@ -238,7 +238,10 @@ async def chat(payload: ChatRequest):
     messages.append({"role": "user", "content": payload.query})
 
     # 3. 取本次请求要用的后端（不传就用默认）
-    model = get_model(payload.provider)
+    #    先算出名字，后面要拿它回传 X-Provider；get_model 会校验名字合不合法。
+    provider_name = payload.provider or DEFAULT_PROVIDER
+    model = get_model(provider_name)
+    cfg = _PROVIDERS[provider_name]
 
     # 4. 绑定本次请求的采样参数
     bound = model.bind(
@@ -263,9 +266,12 @@ async def chat(payload: ChatRequest):
                 yield chunk.content
 
     # charset 要显式写：只写 text/plain 时，某些客户端会按 latin-1 解码，中文变乱码。
+    # X-Provider / X-Model 让调用方一眼看出这次是谁服务的——
+    # 排查"到底切没切成功"全靠它，否则只能靠猜。
     return StreamingResponse(
         generate_response(),
         media_type="text/plain; charset=utf-8",
+        headers={"X-Provider": cfg.name, "X-Model": cfg.model},
     )
 
 

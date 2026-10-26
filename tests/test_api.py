@@ -402,8 +402,11 @@ def test_请求可指定provider(client, monkeypatch, fake_model):
     assert seen == ["ollama"]
 
 
-def test_不传provider时传None(client, monkeypatch, fake_model):
-    """不传时要把 None 交给 get_model，让它自己决定用默认值。"""
+def test_不传provider时用默认名字(client, monkeypatch, fake_model):
+    """默认值现在在路由层解析：路由先把 None 换成默认名字，再交给 get_model。
+
+    为什么改到路由层：路由自己也要知道"用的是谁"，才能回传 X-Provider 响应头。
+    """
     seen = []
 
     def fake_get_model(provider=None):
@@ -413,7 +416,7 @@ def test_不传provider时传None(client, monkeypatch, fake_model):
     monkeypatch.setattr(fastapi_bot, "get_model", fake_get_model)
 
     client.post("/chat", json={"query": "hi"}, headers=HEADERS)
-    assert seen == [None]
+    assert seen == [fastapi_bot.DEFAULT_PROVIDER]
 
 
 def test_未知provider抛400():
@@ -423,3 +426,18 @@ def test_未知provider抛400():
 
     assert excinfo.value.status_code == 400
     assert "不存在的后端" in excinfo.value.detail
+
+def test_响应头标明实际使用的后端(client):
+    """让调用方能看出这次是谁服务的——否则"切没切成功"只能靠猜。"""
+    cfg = fastapi_bot._PROVIDERS[fastapi_bot.DEFAULT_PROVIDER]
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+    assert r.headers["X-Provider"] == cfg.name
+    assert r.headers["X-Model"] == cfg.model
+
+
+def test_响应头跟随指定的provider(client):
+    r = client.post(
+        "/chat", json={"query": "hi", "provider": "ollama"}, headers=HEADERS
+    )
+    assert r.headers["X-Provider"] == "ollama"
+    assert r.headers["X-Model"] == fastapi_bot._PROVIDERS["ollama"].model

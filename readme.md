@@ -307,7 +307,7 @@ api_key_env = "SILICONFLOW_API_KEY"     # 密钥所在的 .env 变量名
 
 [providers.ollama]
 base_url = "http://127.0.0.1:11434/v1"
-model = "qwen2.5:7b"
+model = "qwen2.5:0.5b"
 api_key_env = ""                         # 本地服务不校验 key
 ```
 
@@ -334,6 +334,32 @@ curl http://127.0.0.1:6066/providers -H "X-API-Key: $GATEWAY_API_KEY"
 一个看起来更灵活的设计是让请求带上任意地址。**那是一个 SSRF 漏洞**：客户端可以让你的服务器去访问任意内网地址（例如云厂商元数据 `169.254.169.254`）。
 
 所以这里只接受 **provider 名字**，真实 URL 由服务端配置决定。想接一个新后端，正确做法是让管理员改 `providers.toml`，而不是让终端用户传 URL。
+
+### 每次响应都标明是谁服务的
+
+响应头里带 `X-Provider` 和 `X-Model`，不用猜"到底切没切成功"：
+
+```bash
+curl -i -s -X POST http://127.0.0.1:6066/chat \
+  -H "X-API-Key: $GATEWAY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"query": "你好", "provider": "ollama"}' | head -5
+
+# HTTP/1.1 200 OK
+# x-provider: ollama
+# x-model: qwen2.5:0.5b
+```
+
+### 实测记录
+
+两个后端都真实跑通过（不是假模型）：
+
+| 请求 | X-Provider | X-Model | 耗时 | 返回内容 |
+|---|---|---|---|---|
+| 不传 `provider` | `siliconflow` | `Qwen/Qwen2.5-7B-Instruct` | 3.69s | "我是一个来自阿里云的语言模型，名叫通义千问…" |
+| `provider: "ollama"` | `ollama` | `qwen2.5:0.5b` | 4.08s | "我是一个AI助手，可以回答各种问题。" |
+| `provider: "不存在的"` | — | — | — | `400 未知的 provider：'不存在的'；可用的有：['siliconflow', 'ollama']` |
+
+第一行来自云端 7B，第二行来自本机 0.5B——**两条完全不同的链路，同一个接口**。
 
 ## ❓ 常见问题
 
