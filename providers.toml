@@ -1,0 +1,21 @@
+# 可用的模型后端注册表。
+#
+# 设计原则：结构在这里，密钥在 .env 里。
+# 这个文件可以安全提交——它只包含"变量名"（api_key_env），不包含密钥本身。
+#
+# 加一个新后端 = 加一段 [providers.xxx] + 在 .env 里补对应的 key。
+
+# 请求里不指定 provider 时用哪个
+default = "siliconflow"
+
+[providers.siliconflow]
+base_url = "https://api.siliconflow.cn/v1"
+model = "Qwen/Qwen2.5-7B-Instruct"
+api_key_env = "SILICONFLOW_API_KEY"
+
+# 本地 Ollama：需要先在本机跑起来（ollama serve），且要拉过模型（ollama pull qwen2.5:7b）。
+# 本地服务不校验 key，所以 api_key_env 留空。
+[providers.ollama]
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3:8b"
+api_key_env = ""
