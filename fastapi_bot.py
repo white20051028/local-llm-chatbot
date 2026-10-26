@@ -26,6 +26,7 @@ from schemas import ChatRequest
 import asyncio
 import logging
 import openai
+from providers import load_providers
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -105,7 +106,11 @@ async def on_request_validation_error(request: Request, exc: RequestValidationEr
 
 
 # 三个必需的环境变量，缺任何一个都调不动模型。
-MODEL_ENV_KEYS = ("SILICONFLOW_API_KEY", "SILICONFLOW_BASE_URL", "SILICONFLOW_MODEL")
+# 启动时加载一次。配置有问题会在这里直接报错、服务起不来——这是对的，
+# 总比运行到第一个请求时才炸好。
+_PROVIDERS, DEFAULT_PROVIDER = load_providers(
+    os.path.join(BASE_DIR, "providers.toml")
+)
 
 _model: ChatOpenAI | None = None
 
@@ -126,20 +131,20 @@ def get_model() -> ChatOpenAI:
     """
     global _model
     if _model is None:
-        missing = [key for key in MODEL_ENV_KEYS if not os.getenv(key)]
-        if missing:
-            # 说人话的 500：把"缺哪个变量"直接写在响应里，
-            # 排查时间从半小时变成十秒。
+        cfg = _PROVIDERS[DEFAULT_PROVIDER]
+
+        # 这个 provider 如果要 key，就检查那个变量在不在
+        if cfg.api_key_env and not os.getenv(cfg.api_key_env):
             raise HTTPException(
                 status_code=500,
-                detail=f"服务端缺少配置：{', '.join(missing)}，请检查 .env 后重启服务",
-            )
+                detail=f"provider '{cfg.name}' 需要环境变量 {cfg.api_key_env}，请检查 .env",
+        )
         connect_timeout = float(os.getenv("LLM_CONNECT_TIMEOUT", "5"))
         read_timeout = float(os.getenv("LLM_READ_TIMEOUT", "15"))
         _model = ChatOpenAI(
-            api_key=os.getenv("SILICONFLOW_API_KEY"),
-            base_url=os.getenv("SILICONFLOW_BASE_URL"),
-            model=os.getenv("SILICONFLOW_MODEL"),
+            api_key=os.getenv(cfg.api_key_env) if cfg.api_key_env else "not-needed",
+            base_url=cfg.base_url,
+            model=cfg.model,
             request_timeout=(connect_timeout, read_timeout), # 元组是(连接，读取)、
             max_retries=0, # 关掉底层的隐式重试
         )
@@ -149,10 +154,12 @@ def get_model() -> ChatOpenAI:
 @app.get("/health", summary="健康检查（无需鉴权）")
 async def health():
     """探活接口。顺便回显当前生效的配置，避免"改了没生效"的排查成本。"""
+    cfg = _PROVIDERS[DEFAULT_PROVIDER]
     return {
         "status": "ok",
-        "model": os.getenv("SILICONFLOW_MODEL"),
-        "base_url": os.getenv("SILICONFLOW_BASE_URL"),
+        "provider": cfg.name,
+        "model": cfg.model,
+        "base_url": cfg.base_url,
         "timeout": f"{os.getenv('LLM_CONNECT_TIMEOUT', '5')}/{os.getenv('LLM_READ_TIMEOUT', '15')}",
     }
 
