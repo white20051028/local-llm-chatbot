@@ -202,6 +202,24 @@ async def _open_stream(bound, messages):
 
     raise last_error if last_error else RuntimeError("上游没有返回任何内容")
 
+@app.get(
+    "/providers",
+    summary="列出可用的模型后端",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_providers():
+    """给前端用：告诉它有哪些后端可选、默认是哪个。
+
+    故意不回传 base_url 和 api_key_env：
+    前者可能是内网地址，后者是内部实现细节。
+    """
+    return {
+        "default": DEFAULT_PROVIDER,
+        "providers": [
+            {"name": cfg.name, "model": cfg.model}
+            for cfg in _PROVIDERS.values()
+        ],
+    }
 @app.post("/chat", summary="流式对话接口", dependencies=[Depends(require_api_key)])
 async def chat(payload: ChatRequest):
     # 1. 按轮数裁剪历史。history_len=0 表示一条历史都不带。

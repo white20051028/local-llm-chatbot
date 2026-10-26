@@ -90,6 +90,18 @@ def test_health_无需鉴权(client):
     # 安全：绝对不能把 API Key 回显出去
     assert "sk-" not in r.text
 
+def test_非ASCII的key返回401(client):
+    """Header 是客户端可控的，可能带任意字节 —— 不能因为编码问题变成 500。
+
+    用 bytes 而不是 str 传：httpx 会先把非 ASCII 的 str 拒掉，
+    这样测的就不是服务端了。真实客户端（curl/浏览器）不会拦。
+    """
+    r = client.post(
+        "/chat",
+        json={"query": "hi"},
+        headers={"X-API-Key": "中文密钥".encode("utf-8")},
+    )
+    assert r.status_code == 401
 
 def test_缺少_api_key_返回401(client):
     r = client.post("/chat", json={"query": "你好"})
@@ -347,3 +359,67 @@ def test_400错误不重试(client, fast_retry, monkeypatch):
 
     assert r.status_code == 502
     assert boom.calls == 1
+
+# ---------------------------------------------------------------- 多后端
+def test_providers接口列出可选后端(client):
+    r = client.get("/providers", headers=HEADERS)
+    assert r.status_code == 200
+
+    body = r.json()
+    assert body["default"] == "siliconflow"
+
+    names = [p["name"] for p in body["providers"]]
+    assert "siliconflow" in names
+    assert "ollama" in names
+
+    # 敏感/内部字段不能回传
+    assert "base_url" not in body["providers"][0]
+    assert "api_key_env" not in body["providers"][0]
+
+
+def test_providers接口需要鉴权(client):
+    assert client.get("/providers").status_code == 401
+
+
+def test_health回显当前provider(client):
+    assert client.get("/health").json()["provider"] == "siliconflow"
+
+
+def test_请求可指定provider(client, monkeypatch, fake_model):
+    """客户端传了 provider，路由要把它原样交给 get_model。"""
+    seen = []
+
+    def fake_get_model(provider=None):
+        seen.append(provider)
+        return fake_model
+
+    monkeypatch.setattr(fastapi_bot, "get_model", fake_get_model)
+
+    r = client.post(
+        "/chat", json={"query": "hi", "provider": "ollama"}, headers=HEADERS
+    )
+    assert r.status_code == 200
+    assert seen == ["ollama"]
+
+
+def test_不传provider时传None(client, monkeypatch, fake_model):
+    """不传时要把 None 交给 get_model，让它自己决定用默认值。"""
+    seen = []
+
+    def fake_get_model(provider=None):
+        seen.append(provider)
+        return fake_model
+
+    monkeypatch.setattr(fastapi_bot, "get_model", fake_get_model)
+
+    client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+    assert seen == [None]
+
+
+def test_未知provider抛400():
+    """名字不在注册表里 = 客户端传错了，400 而不是 500。"""
+    with pytest.raises(HTTPException) as excinfo:
+        _REAL_GET_MODEL("不存在的后端")
+
+    assert excinfo.value.status_code == 400
+    assert "不存在的后端" in excinfo.value.detail
