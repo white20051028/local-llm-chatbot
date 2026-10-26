@@ -84,8 +84,11 @@ def test_health_无需鉴权(client):
     body = r.json()
     assert body["status"] == "ok"
     # 配置回显：只断言字段存在，不断言具体值（值随 .env 变化）
-    for key in ("model", "base_url", "timeout"):
+    for key in ("provider", "model", "timeout"):
         assert key in body
+
+    # /health 免鉴权，绝不能回显 base_url（可能指向内网地址）
+    assert "base_url" not in body
 
     # 安全：绝对不能把 API Key 回显出去
     assert "sk-" not in r.text

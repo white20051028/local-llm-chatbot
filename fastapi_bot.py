@@ -158,13 +158,17 @@ def get_model(provider: str | None = None) -> ChatOpenAI:
 # 这里加了个配置回显，以后一条名了就可以看出服务到底在和谁说话 curl.exe -s http://127.0.0.1:6066/health
 @app.get("/health", summary="健康检查（无需鉴权）")
 async def health():
-    """探活接口。顺便回显当前生效的配置，避免"改了没生效"的排查成本。"""
+    """探活接口。回显当前生效的后端与模型，避免"改了没生效"的排查成本。
+
+    故意不回显 base_url：这个接口**免鉴权**，而 base_url 可能指向内网地址
+    （本地 Ollama 是 127.0.0.1，公司内网可能是 10.x），等于对外泄露拓扑。
+    需要看 base_url 时去启动日志或需要鉴权的 /providers 拿。
+    """
     cfg = _PROVIDERS[DEFAULT_PROVIDER]
     return {
         "status": "ok",
         "provider": cfg.name,
         "model": cfg.model,
-        "base_url": cfg.base_url,
         "timeout": f"{os.getenv('LLM_CONNECT_TIMEOUT', '5')}/{os.getenv('LLM_READ_TIMEOUT', '15')}",
     }
 
