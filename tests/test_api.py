@@ -7,6 +7,7 @@
 - 鉴权：没带 key / 带错 key → 401；/health 不需要 key
 - 校验：缺字段、role 非法、history 里塞 system、参数越界、多传字段 → 422
 - 业务：正常请求能拿到流式内容；history_len 的裁剪语义正确
+- 韧性：上游超时返回 502、400 类错误不重试、重试不影响正常路径
 """
 
 from types import SimpleNamespace
@@ -15,7 +16,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import auth
+import fastapi_bot
 from fastapi_bot import app, get_model
+
+import httpx
+import openai
 
 TEST_KEY = "test-key-0000"
 HEADERS = {"X-API-Key": TEST_KEY}
@@ -37,6 +42,20 @@ class FakeModel:
         for piece in ("你", "好"):
             yield SimpleNamespace(content=piece)
 
+class BoomModel:
+    """假的失败模型：按指定次数抛同一个异常，并记录被调用了几次。"""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls = 0
+
+    def bind(self, **kwargs):
+        return self
+
+    async def astream(self, messages):
+        self.calls += 1
+        raise self.exc
+        yield  # 让它成为异步生成器（这行不会执行到）
 
 @pytest.fixture
 def fake_model():
@@ -62,7 +81,15 @@ def client():
 def test_health_无需鉴权(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+
+    body = r.json()
+    assert body["status"] == "ok"
+    # 配置回显：只断言字段存在，不断言具体值（值随 .env 变化）
+    for key in ("model", "base_url", "timeout"):
+        assert key in body
+
+    # 安全：绝对不能把 API Key 回显出去
+    assert "sk-" not in r.text
 
 
 def test_缺少_api_key_返回401(client):
@@ -182,7 +209,6 @@ def test_模型配置缺失时返回可读的错误(client, monkeypatch):
     服务端连模型都没配好时，任何请求都应该先报"服务器配置有问题"。
     这个顺序是刻意的——把 500 的文案做得足够清楚，比调整顺序更重要。
     """
-    import fastapi_bot
 
     app.dependency_overrides.pop(get_model, None)
     monkeypatch.setattr(fastapi_bot, "_model", None)
@@ -272,3 +298,62 @@ def test_多轮对话_Gradio完整形状(client):
     body = {"query": "第五问", "history": history, "history_len": 4}
     r = client.post("/chat", json=body, headers=HEADERS)
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------- 韧性：超时与重试
+class BoomModel:
+    """假的失败模型：抛指定异常，并记录被调用了几次。"""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls = 0
+
+    def bind(self, **kwargs):
+        return self
+
+    async def astream(self, messages):
+        self.calls += 1
+        raise self.exc
+        yield  # 让它成为异步生成器（不会执行到）
+
+
+def _fake_request():
+    return httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+
+
+@pytest.fixture
+def fast_retry(monkeypatch):
+    """让重试不真的睡觉，否则这两个测试要多跑 3 秒。"""
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(fastapi_bot.asyncio, "sleep", _no_sleep)
+    monkeypatch.setenv("LLM_MAX_ATTEMPTS", "3")
+
+
+def test_上游超时返回502(client, fast_retry):
+    """超时是可重试错误：试满 3 次仍失败，才返回 502。"""
+    boom = BoomModel(openai.APITimeoutError(request=_fake_request()))
+    app.dependency_overrides[get_model] = lambda: boom
+
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+
+    assert r.status_code == 502
+    assert "Timeout" in r.json()["detail"]
+    assert boom.calls == 3
+
+
+def test_400错误不重试(client, fast_retry):
+    """参数错误重试一百次也一样，必须只调用一次。"""
+    exc = openai.BadRequestError(
+        "bad request",
+        response=httpx.Response(400, request=_fake_request()),
+        body=None,
+    )
+    boom = BoomModel(exc)
+    app.dependency_overrides[get_model] = lambda: boom
+
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+
+    assert r.status_code == 502
+    assert boom.calls == 1
