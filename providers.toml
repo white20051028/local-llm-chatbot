@@ -8,10 +8,15 @@
 # 请求里不指定 provider 时用哪个
 default = "siliconflow"
 
+# 你希望的降级顺序（可省略）。没被点名的后端，按下面各段的先后顺序排在后面。
+# 这里把 Deepseek 和 ollama 提前，收费的 deepseek-flash 就自然落到最后。
+priority = ["Deepseek", "ollama"]
+
 [providers.siliconflow]
 base_url = "https://api.siliconflow.cn/v1"
 model = "Qwen/Qwen2.5-7B-Instruct"
 api_key_env = "SILICONFLOW_API_KEY"
+fallback = ["deepseek-flash", "ollama"]
 
 # 同一个服务商、换一个模型 —— 用来验证 model 字段真的生效。
 # 和 siliconflow 共用同一个 key，只是 model 不同。

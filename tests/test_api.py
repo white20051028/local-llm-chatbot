@@ -69,6 +69,9 @@ def _patch(monkeypatch, fake_model):
     monkeypatch.setattr(auth, "API_KEY", TEST_KEY)
     # 路由现在直接调用 get_model()，不再经过 Depends，
     monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: fake_model)
+    # 测试里给一条确定的降级链。真实探测在 PROBE_ON_STARTUP=false 时不会跑，
+    # 不设的话 _CHAIN 只有默认后端，降级相关测试就测不到了。
+    monkeypatch.setattr(fastapi_bot, "_CHAIN", [fastapi_bot.DEFAULT_PROVIDER, "ollama"])
     yield
 
 @pytest.fixture
@@ -337,11 +340,12 @@ def fast_retry(monkeypatch):
 
 # 第 334 行：加一个参数
 def test_上游超时返回502(client, fast_retry, monkeypatch):
-    """超时是可重试错误：试满 3 次仍失败，才返回 502。"""
+    """单个后端（无降级链）超时：重试 3 次仍失败，返回 502。"""
     boom = BoomModel(openai.APITimeoutError(request=_fake_request()))
     monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
 
-    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+    # 指定 ollama：它的 fallback 是空的，所以只会试这一个后端，次数才确定
+    r = client.post("/chat", json={"query": "hi", "provider": "ollama"}, headers=HEADERS)
 
     assert r.status_code == 502
     assert "Timeout" in r.json()["detail"]
@@ -444,3 +448,30 @@ def test_响应头跟随指定的provider(client):
     )
     assert r.headers["X-Provider"] == "ollama"
     assert r.headers["X-Model"] == fastapi_bot._PROVIDERS["ollama"].model
+
+
+def test_降级链全挂返回502(client, fast_retry, monkeypatch):
+    """链上每个后端都重试到耗尽，最后返回 502。"""
+    boom = BoomModel(openai.APITimeoutError(request=_fake_request()))
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
+
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+
+    assert r.status_code == 502
+    assert "Timeout" in r.json()["detail"]    
+
+
+def test_主后端挂了自动降级到备用(client, monkeypatch, fake_model):
+    """主后端缺 key（500）→ 不重试，直接降级；备用能用 → 200 + X-Fallback-From。"""
+    def fake_get_model(provider=None):
+        if provider == "ollama":
+            return fake_model
+        raise HTTPException(status_code=500, detail=f"provider '{provider}' 需要环境变量")
+
+    monkeypatch.setattr(fastapi_bot, "get_model", fake_get_model)
+
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+
+    assert r.status_code == 200
+    assert r.headers["X-Provider"] == "ollama"
+    assert r.headers["X-Fallback-From"] == "siliconflow"
