@@ -29,6 +29,7 @@ import openai
 from providers import BackendState, build_chain, load_providers
 from probe import probe_all
 import time
+from ratelimit import rate_limit
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -340,7 +341,11 @@ async def list_providers():
             for cfg in _PROVIDERS.values()
         ],
     }
-@app.post("/chat", summary="流式对话接口", dependencies=[Depends(require_api_key)])
+@app.post(
+    "/chat",
+    summary="流式对话接口",
+    dependencies=[Depends(require_api_key), Depends(rate_limit)],
+)
 async def chat(payload: ChatRequest):
     # 1. 按轮数裁剪历史。history_len=0 表示一条历史都不带。
     #    原代码写的是 `if history_len > 0 and len(history) > history_len*2`，
