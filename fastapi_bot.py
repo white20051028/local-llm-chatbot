@@ -26,7 +26,9 @@ from schemas import ChatRequest
 import asyncio
 import logging
 import openai
-from providers import load_providers
+from providers import BackendState, build_chain, load_providers
+from probe import probe_all
+import time
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -107,23 +109,56 @@ async def on_request_validation_error(request: Request, exc: RequestValidationEr
 
 # 启动时加载一次。配置有问题会在这里直接报错、服务起不来——这是对的，
 # 总比运行到第一个请求时才炸好。
-_PROVIDERS, DEFAULT_PROVIDER = load_providers(
+_PROVIDERS, DEFAULT_PROVIDER, PRIORITY = load_providers(
     os.path.join(BASE_DIR, "providers.toml")
 )
 
-# 启动时把注册表打出来。
-# 为什么需要这行：uvicorn 的 --reload 只监听 .py，不监听 .toml，
-# 所以改完 providers.toml 必须手动重启；没有这行日志，你没法确认"新后端进来了没"。
-logger.info(
-    "已加载 %d 个模型后端（默认 %s）：%s",
-    len(_PROVIDERS),
-    DEFAULT_PROVIDER,
-    "、".join(_PROVIDERS),
-)
+# 探测结果和降级链，由 _init_backends() 在下面填充
+_STATES: dict[str, BackendState] = {}
+_CHAIN: list[str] = [DEFAULT_PROVIDER]
 
 # 按 provider 名字缓存 client：每个后端只建一次（内部有连接池），之后复用。
 _clients: dict[str, ChatOpenAI] = {}
 
+def _init_backends() -> None:
+    """启动时探测每个后端，生成降级链。
+
+    探测失败的后端不踢掉，只排到链尾并标"未验证"——
+    网络抖一下也会探测失败，不能因此误杀一个能用的后端。
+    """
+    global _CHAIN, _STATES
+
+    # 测试里会把这个设成 false：否则每个测试都会真的发一次网络请求
+    if os.getenv("PROBE_ON_STARTUP", "true").lower() != "true":
+        _CHAIN = [DEFAULT_PROVIDER, *[n for n in PRIORITY if n != DEFAULT_PROVIDER]]
+        logger.info("跳过探测（PROBE_ON_STARTUP=false）；降级链：%s", " → ".join(_CHAIN))
+        return
+
+    logger.info("探测模型后端可用性……")
+    _STATES = probe_all(_PROVIDERS)
+
+    for name, state in _STATES.items():
+        if state.verified:
+            logger.info(
+                "  [可用]   %-14s %5dms  %s", name, state.latency_ms, _PROVIDERS[name].model
+            )
+        else:
+            logger.info("  [不可用] %-14s    ——    %s", name, state.reason)
+
+    _CHAIN = build_chain(_PROVIDERS, DEFAULT_PROVIDER, PRIORITY, _STATES)
+
+    if len(_CHAIN) == 1:
+        logger.info("已加载 1 个后端，无降级链（请求路径零额外开销）")
+        return
+
+    parts = [
+        name if _STATES.get(name) and _STATES[name].verified else f"{name}(未验证)"
+        for name in _CHAIN
+    ]
+    logger.info("降级链：%s", " → ".join(parts))
+
+
+_init_backends()
 
 def get_model(provider: str | None = None) -> ChatOpenAI:
     """按名字取模型客户端；不传就用默认 provider。"""
@@ -188,16 +223,37 @@ def _is_retryable(exc: Exception) -> bool:
         return exc.status_code == 429 or exc.status_code >= 500
     return False
 
-async def _open_stream(bound, messages):
+def _should_fallback(exc: Exception) -> bool:
+    """这个错误值不值得换一个后端再试。
+
+    和 _is_retryable 的区别：那个问"同一个后端要不要再试一次"，
+    这个问"要不要换一个后端"。
+
+    该降级：超时 / 连不上 / 5xx / 401 403（key 错、欠费）/ 我们自己抛的 500（缺 key）
+    不该降级：400 422（请求本身不合法，换谁都一样错）
+    """
+    if isinstance(exc, HTTPException):
+        return exc.status_code >= 500
+    if isinstance(exc, openai.BadRequestError):
+        return False
+    if isinstance(exc, openai.UnprocessableEntityError):
+        return False
+    return True
+
+async def _open_stream(bound, messages, deadline: float | None = None):
     """打开上游流并返回 (stream, 第一个有内容的 chunk)。
 
-    失败时先判断错误类型：可重试的按指数退避重试，不可重试的直接抛。
+    deadline 是整条降级链的截止时刻（time.monotonic() 的时间点）。
+    剩余时间不够就不再重试，把错误抛给上层去决定要不要换后端。
     """
     max_attempts = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
-        stream = bound.astream(messages)      # 每次重试都要新建一个流
+        if deadline is not None and time.monotonic() >= deadline:
+            raise last_error if last_error else TimeoutError("总预算已用完")
+
+        stream = bound.astream(messages)
         try:
             async for chunk in stream:
                 if chunk.content:
@@ -206,7 +262,7 @@ async def _open_stream(bound, messages):
             if not _is_retryable(e) or attempt == max_attempts:
                 raise
             last_error = e
-            backoff = 2 ** (attempt - 1)      # 1s, 2s, 4s...
+            backoff = 2 ** (attempt - 1)
             logger.warning(
                 "上游失败（第 %d/%d 次，%s），%d 秒后重试",
                 attempt, max_attempts, type(e).__name__, backoff,
@@ -215,21 +271,72 @@ async def _open_stream(bound, messages):
 
     raise last_error if last_error else RuntimeError("上游没有返回任何内容")
 
+async def _open_stream_with_fallback(chain, messages, *, temperature, top_p, max_tokens):
+    """按 chain 顺序逐个尝试后端，返回 (实际用的名字, stream, first_chunk)。
+
+    两层重试的分工：
+      _open_stream                → 同一个后端内部重试 N 次
+      _open_stream_with_fallback  → 这个后端彻底不行了，换下一个
+    """
+    # 只有一个后端时完全没有降级可言：直接走原路径，零额外开销
+    if len(chain) <= 1:
+        name = chain[0]
+        model = get_model(name)
+        bound = model.bind(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        stream, first_chunk = await _open_stream(bound, messages)
+        return name, stream, first_chunk
+    
+    budget = float(os.getenv("LLM_FALLBACK_BUDGET", "50"))
+    deadline = time.monotonic() + budget
+    last_error: Exception | None = None
+
+    for index, name in enumerate(chain):
+        if time.monotonic() >= deadline:
+            logger.warning("总预算 %.0f 秒用完，放弃剩余 %d 个后端", budget, len(chain) - index)
+            break
+
+        if index > 0:
+            logger.warning("降级：切换到第 %d 顺位的 %s", index + 1, name)
+
+        try:
+            model = get_model(name)
+            bound = model.bind(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+            stream, first_chunk = await _open_stream(bound, messages, deadline=deadline)
+        except Exception as e:
+            if not _should_fallback(e):
+                raise
+            last_error = e
+            logger.warning("provider %s 失败（%s），准备降级", name, type(e).__name__)
+            continue
+
+        if index > 0:
+            logger.warning("降级成功：本次实际由 %s 提供服务", name)
+        return name, stream, first_chunk
+
+    raise last_error if last_error else RuntimeError("所有后端都不可用")
+
 @app.get(
     "/providers",
     summary="列出可用的模型后端",
     dependencies=[Depends(require_api_key)],
 )
 async def list_providers():
-    """给前端用：告诉它有哪些后端可选、默认是哪个。
+    """给前端用：可选后端、当前降级链、每个后端是否验证过。
 
     故意不回传 base_url 和 api_key_env：
     前者可能是内网地址，后者是内部实现细节。
     """
     return {
         "default": DEFAULT_PROVIDER,
+        "chain": _CHAIN,
         "providers": [
-            {"name": cfg.name, "model": cfg.model}
+            {
+                "name": cfg.name,
+                "model": cfg.model,
+                "verified": bool(_STATES[cfg.name].verified) if cfg.name in _STATES else False,
+                "latency_ms": _STATES[cfg.name].latency_ms if cfg.name in _STATES else None,
+                "reason": _STATES[cfg.name].reason if cfg.name in _STATES else "未探测",
+            }
             for cfg in _PROVIDERS.values()
         ],
     }
@@ -250,27 +357,40 @@ async def chat(payload: ChatRequest):
     messages.extend(msg.model_dump() for msg in history)
     messages.append({"role": "user", "content": payload.query})
 
-    # 3. 取本次请求要用的后端（不传就用默认）
-    #    先算出名字，后面要拿它回传 X-Provider；get_model 会校验名字合不合法。
-    provider_name = payload.provider or DEFAULT_PROVIDER
-    model = get_model(provider_name)
-    cfg = _PROVIDERS[provider_name]
+    # 3. 决定这次用哪些后端
+    #    显式指定了 provider 就只用它：用户说"我要 ollama"，就不该偷偷换成别的
+    if payload.provider:
+        chain = [payload.provider]
+        if payload.provider not in _PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知的 provider：{payload.provider!r}；"
+                       f"可用的有：{list(_PROVIDERS)}",
+            )
+    else:
+        chain = _CHAIN or [DEFAULT_PROVIDER]
+    provider_name = chain[0]
 
-    # 4. 绑定本次请求的采样参数
-    bound = model.bind(
-        temperature=payload.temperature,
-        top_p=payload.top_p,
-        max_tokens=payload.max_tokens,
-    )
-
-    # 5. 先连上游、拿到第一个 chunk。
-    #    关键：失败必须发生在这里（还没返回响应），而不是在流开始之后。
-
+    # 4-5. 按链依次尝试：每个后端内部会重试，彻底不行才换下一个
     try:
-        stream, first_chunk = await _open_stream(bound, messages)
+        used_name, stream, first_chunk = await _open_stream_with_fallback(
+            chain,
+            messages,
+            temperature=payload.temperature,
+            top_p=payload.top_p,
+            max_tokens=payload.max_tokens,
+        )
     except Exception as e:
-        logger.exception("调用上游失败")   # ← 加这行
-        raise HTTPException(status_code=502, detail=f"上游模型服务不可用：{type(e).__name__}")
+        logger.exception("所有后端都失败")
+        raise HTTPException(
+            status_code=502,
+            detail=f"上游模型服务不可用：{type(e).__name__}",
+        )
+
+    cfg = _PROVIDERS[used_name]
+    headers = {"X-Provider": cfg.name, "X-Model": cfg.model}
+    if used_name != provider_name:
+        headers["X-Fallback-From"] = provider_name      # 告诉调用方发生了降级
 
     async def generate_response():
         yield first_chunk.content
@@ -284,7 +404,7 @@ async def chat(payload: ChatRequest):
     return StreamingResponse(
         generate_response(),
         media_type="text/plain; charset=utf-8",
-        headers={"X-Provider": cfg.name, "X-Model": cfg.model},
+        headers=headers
     )
 
 

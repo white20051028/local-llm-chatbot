@@ -39,17 +39,16 @@ def check(label, fn):
         print(f"        {type(e).__name__}: {e}")
         failed += 1
 
-
 def case_normal():
-    providers, default = load_providers(ROOT / "providers.toml")
+    providers, default, priority = load_providers(ROOT / "providers.toml")
 
     assert isinstance(providers, dict), "第一个返回值应该是 dict"
     assert "siliconflow" in providers, "应该有 siliconflow"
     assert "ollama" in providers, "应该有 ollama"
     assert default == "siliconflow", f"default 应该是 siliconflow，实际是 {default!r}"
+    assert isinstance(priority, list), "第三个返回值应该是 list"
 
     cfg = providers["siliconflow"]
-    # 允许 dataclass / 普通对象 / dict 三种写法，方便你自由实现
     get = (lambda k: getattr(cfg, k)) if not isinstance(cfg, dict) else (lambda k: cfg[k])
     assert get("base_url").startswith("https://"), "base_url 没读对"
     assert get("model"), "model 是空的"

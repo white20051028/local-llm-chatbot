@@ -15,9 +15,10 @@ sys.path.insert(0, str(ROOT))
 
 import providers  # noqa: E402
 
-configs, default = providers.load_providers(ROOT / "providers.toml")
+configs, default, priority = providers.load_providers(ROOT / "providers.toml")
 
 print("默认 provider:", default)
+print("priority（用户偏好）:", priority if priority else "（未设置，按探测延迟排）")
 print()
 print(f"一共有 {len(configs)} 个 provider：")
 for name, cfg in configs.items():

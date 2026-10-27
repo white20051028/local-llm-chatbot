@@ -259,7 +259,8 @@ $ python tools/probe_failure.py
 ├── schemas.py            # 请求体模型（Pydantic），负责字段与上下界校验
 ├── auth.py               # API Key 鉴权依赖
 ├── providers.toml        # 模型后端注册表（结构在此，密钥在 .env）
-├── providers.py          # 读取并校验 providers.toml
+├── providers.py          # 读取并校验 providers.toml，生成降级链
+├── probe.py              # 启动时探测每个后端能不能出字（max_tokens=1）
 ├── gradio_ui.py          # 前端：Gradio 聊天界面与参数面板
 ├── tests/
 │   └── test_api.py       # 接口测试（pytest，34 条）
@@ -365,6 +366,89 @@ curl -i -s -X POST http://127.0.0.1:6066/chat \
 | `provider: "不存在的"` | — | — | — | `400 未知的 provider：'不存在的'；可用的有：['siliconflow', 'ollama']` |
 
 第一行来自云端 7B，第二行来自本机 0.5B——**两条完全不同的链路，同一个接口**。
+
+## 🔀 自动降级
+
+主后端挂了，自动换下一个能用的——不用重启，不用人工介入。
+
+### 怎么工作
+
+**启动时探测**每个后端：发一次 `max_tokens=1` 的 chat，看它能不能出字（成本约 20 token）。
+
+```
+INFO:  探测模型后端可用性……
+INFO:    [可用]   siliconflow      354ms  Qwen/Qwen2.5-7B-Instruct
+INFO:    [可用]   deepseek-flash  1083ms  deepseek-ai/DeepSeek-V4.1-Flash
+INFO:    [可用]   ollama          1852ms  qwen2.5:0.5b
+INFO:    [可用]   Deepseek         582ms  deepseek-flash
+INFO:  降级链：siliconflow → deepseek-flash → ollama → Deepseek
+```
+
+**请求时按链走**：一个后端重试到耗尽仍失败，就换下一个。
+
+### 链的顺序怎么定
+
+| 优先级 | 规则 |
+|---|---|
+| 1 | `default` 永远第一位 |
+| 2 | `priority = [...]` 里你点名的，按你写的顺序 |
+| 3 | 其余探测通过的，**按 `providers.toml` 里的段顺序** |
+| 4 | 探测没通过的，排最后（只标"未验证"，**不踢掉**——探测可能误判） |
+
+**为什么不按延迟排**：本地 0.5B 一定比云端大模型快（没有网络往返）。按延迟排会让"最快但最弱"的模型排到前面，正好和想要的相反。延迟只用来显示。
+
+### ⚠️ 链的顺序 = 你的花钱顺序
+
+降级是**自动的、静默的**。主后端一挂，它就按链往下试，不会问你。
+
+| 顺位 | 后端 | 成本 |
+|---|---|---|
+| 1 | `siliconflow`（Qwen2.5-7B） | **免费**（开源模型） |
+| 2 | `Deepseek`（官方） | 按 token 计费 |
+| 3 | `ollama`（本地） | 免费，但 0.5B 较弱 |
+| 4 | `deepseek-flash` | 需充值 |
+
+**只想用免费的**：把收费的从链里去掉，或用 `priority` 把它们排到最后。
+
+### ⚠️ 降级的代价：失败会变慢
+
+降级用"更慢的失败"换"可能成功"：
+
+| 场景 | 没有降级 | 有降级 |
+|---|---|---|
+| 主 key 错，有可用备用 | 0.7s 返回 502 | **0.7s 返回 200** ✅ |
+| 主 key 错，**备用也全挂** | 0.7s 返回 502 | **最差 50s** 才 502 ❌ |
+| 主慢超时（连上不响应） | 48s 返回 502 | 48s 返回 502（预算耗尽，基本不降级） |
+
+最后一行是**故意的**：慢死的后端值得等（它还活着，只是慢），换一个不一定更快。
+
+总预算由 `LLM_FALLBACK_BUDGET` 控制（默认 50 秒），超了就不再往下试。
+
+### 只有一个后端时
+
+链长 = 1，**降级逻辑完全不参与**，请求路径零额外开销。主挂了直接 502——不假装还能救。
+
+### 实测：主 key 失效
+
+把 `SILICONFLOW_API_KEY` 故意改错，重启服务后请求：
+
+```
+状态码          : 200
+X-Provider      : ollama
+X-Model         : qwen2.5:0.5b
+X-Fallback-From : siliconflow
+耗时            : 0.67 秒
+```
+
+服务端日志：
+
+```
+WARNING:  provider siliconflow 失败（OpenAIAuthenticationError），准备降级
+WARNING:  降级：切换到第 2 顺位的 ollama
+WARNING:  降级成功：本次实际由 ollama 提供服务
+```
+
+**0.67 秒内，从"主后端 401"变成"用户拿到回答"。**
 
 ## ❓ 常见问题
 
