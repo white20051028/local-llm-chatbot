@@ -21,6 +21,7 @@ from fastapi_bot import app, get_model
 
 import httpx
 import openai
+import ratelimit
 
 _REAL_GET_MODEL = fastapi_bot.get_model
 TEST_KEY = "test-key-0000"
@@ -72,6 +73,8 @@ def _patch(monkeypatch, fake_model):
     # 测试里给一条确定的降级链。真实探测在 PROBE_ON_STARTUP=false 时不会跑，
     # 不设的话 _CHAIN 只有默认后端，降级相关测试就测不到了。
     monkeypatch.setattr(fastapi_bot, "_CHAIN", [fastapi_bot.DEFAULT_PROVIDER, "ollama"])
+    # 限流计数是模块级全局的，不清会导致测试之间互相影响
+    ratelimit.reset()
     yield
 
 @pytest.fixture
@@ -475,3 +478,51 @@ def test_主后端挂了自动降级到备用(client, monkeypatch, fake_model):
     assert r.status_code == 200
     assert r.headers["X-Provider"] == "ollama"
     assert r.headers["X-Fallback-From"] == "siliconflow"
+
+# ---------------------------------------------------------------- 限流
+def test_限流超限返回429(client, monkeypatch):
+    """超过每分钟上限后返回 429，并带 Retry-After 告诉客户端等多久。"""
+    monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "3")
+
+    for i in range(3):
+        r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+        assert r.status_code == 200, f"第 {i + 1} 次不该被限流"
+
+    r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
+    assert int(r.headers["Retry-After"]) > 0
+    assert "每分钟最多 3 次" in r.json()["detail"]
+
+
+def test_限流按key独立(monkeypatch):
+    """不同 key 各自计数，A 被限流不影响 B。"""
+    ratelimit.reset()
+    monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "2")
+
+    ratelimit.rate_limit("key-a")
+    ratelimit.rate_limit("key-a")
+    with pytest.raises(HTTPException) as excinfo:
+        ratelimit.rate_limit("key-a")
+    assert excinfo.value.status_code == 429
+
+    # key-b 是干净的
+    ratelimit.rate_limit("key-b")
+    ratelimit.rate_limit("key-b")
+
+
+def test_限流窗口滑动后恢复(monkeypatch):
+    """窗口滑过去之后，旧记录被清掉，计数归零。"""
+    ratelimit.reset()
+    monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "2")
+
+    now = [1000.0]
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: now[0])
+
+    ratelimit.rate_limit("k")
+    ratelimit.rate_limit("k")
+    with pytest.raises(HTTPException):
+        ratelimit.rate_limit("k")
+
+    now[0] += 61          # 过了窗口
+    ratelimit.rate_limit("k")      # 不该抛
