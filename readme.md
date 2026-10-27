@@ -377,12 +377,15 @@ curl -i -s -X POST http://127.0.0.1:6066/chat \
 
 ```
 INFO:  探测模型后端可用性……
-INFO:    [可用]   siliconflow      354ms  Qwen/Qwen2.5-7B-Instruct
-INFO:    [可用]   deepseek-flash  1083ms  deepseek-ai/DeepSeek-V4.1-Flash
-INFO:    [可用]   ollama          1852ms  qwen2.5:0.5b
-INFO:    [可用]   Deepseek         582ms  deepseek-flash
-INFO:  降级链：siliconflow → deepseek-flash → ollama → Deepseek
+INFO:    [可用]   siliconflow     1038ms  Qwen/Qwen2.5-7B-Instruct
+INFO:    [可用]   deepseek-flash  2357ms  deepseek-ai/DeepSeek-V4.1-Flash
+INFO:    [可用]   ollama            93ms  qwen2.5:0.5b
+INFO:    [可用]   Deepseek         481ms  deepseek-flash
+INFO:  降级链：siliconflow → Deepseek → ollama → deepseek-flash
 ```
+
+**注意这行链不是按延迟排的**：`ollama` 只用了 93ms（最快），却排在 `Deepseek`（481ms）后面——
+因为 `providers.toml` 里写了 `priority = ["Deepseek", "ollama"]`，用户的显式意愿优先。
 
 **请求时按链走**：一个后端重试到耗尽仍失败，就换下一个。
 
@@ -434,21 +437,28 @@ INFO:  降级链：siliconflow → deepseek-flash → ollama → Deepseek
 
 ```
 状态码          : 200
-X-Provider      : ollama
-X-Model         : qwen2.5:0.5b
+X-Provider      : Deepseek
+X-Model         : deepseek-flash
 X-Fallback-From : siliconflow
-耗时            : 0.67 秒
+耗时            : 1.63 秒
 ```
 
 服务端日志：
 
 ```
+INFO:    [不可用] siliconflow       ——    HTTP 401
+INFO:    [不可用] deepseek-flash    ——    HTTP 401
+INFO:    [可用]   ollama          1554ms  qwen2.5:0.5b
+INFO:    [可用]   Deepseek        1107ms  deepseek-flash
+INFO:  降级链：siliconflow(未验证) → Deepseek → ollama → deepseek-flash(未验证)
 WARNING:  provider siliconflow 失败（OpenAIAuthenticationError），准备降级
-WARNING:  降级：切换到第 2 顺位的 ollama
-WARNING:  降级成功：本次实际由 ollama 提供服务
+WARNING:  降级：切换到第 2 顺位的 Deepseek
+WARNING:  降级成功：本次实际由 Deepseek 提供服务
 ```
 
-**0.67 秒内，从"主后端 401"变成"用户拿到回答"。**
+**1.63 秒内，从"主后端 401"变成"用户拿到回答"。**
+
+注意 `siliconflow` 和 `deepseek-flash` 共用一个 key，所以**两个一起挂**——降级直接把这两个都跳过了。
 
 ## ❓ 常见问题
 

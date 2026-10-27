@@ -7,6 +7,9 @@
 
 # 请求里不指定 provider 时用哪个
 default = "siliconflow"
+
+# 你希望的降级顺序（可省略）。没被点名的后端，按下面各段的先后顺序排在后面。
+# 这里把 Deepseek 和 ollama 提前，收费的 deepseek-flash 就自然落到最后。
 priority = ["Deepseek", "ollama"]
 
 [providers.siliconflow]
