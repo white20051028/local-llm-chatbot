@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"      # 和本地开发环境一致
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 跑测试
+        run: python -m pytest -q
+
+      # 额外证明一次"测试不联网"：换成假 key 也必须全绿。
+      # 如果哪天有人偷偷加了会打真实 API 的测试，这一步会红。
+      - name: 用假 API Key 复跑（证明测试未联网）
+        env:
+          SILICONFLOW_API_KEY: sk-ci-fake-key
+        run: python -m pytest -q
