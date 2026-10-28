@@ -33,6 +33,7 @@ from ratelimit import rate_limit
 import usage
 import tokens
 import re
+import json
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -262,6 +263,17 @@ def _upstream_message(exc: Exception, limit: int = 300) -> str:
         return match.group(1)[:limit]
     return text[:limit]
 
+def _sse_event(event: str, **fields) -> str:
+    """拼一个 SSE 数据块。
+
+    为什么 data 里放 JSON 而不是纯文本：
+      SSE 协议允许 data 有多行，但**每一行都要单独加 "data: " 前缀**。
+      模型输出里换行太常见（列表、代码块），漏一行就悄悄把协议搞坏。
+      json.dumps 会把换行转义成 \\n，永远是单行，不会踩这个坑。
+    """
+    payload = json.dumps(fields, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
 async def _open_stream(bound, messages, deadline: float | None = None):
     """打开上游流并返回 (stream, 第一个有内容的 chunk)。
 
@@ -447,17 +459,9 @@ async def chat(payload: ChatRequest):
     if trimmed:
         headers["X-History-Trimmed"] = str(trimmed)
 
-    async def generate_response():
-        # usage 是累计值：每次覆盖，绝对不能累加。
-        last_usage = getattr(first_chunk, "usage_metadata", None)
 
-        yield first_chunk.content
-        async for chunk in stream:
-            if chunk.content:
-                yield chunk.content
-            if getattr(chunk, "usage_metadata", None):
-                last_usage = chunk.usage_metadata
 
+    def _record(last_usage):
         usage.record(
             provider=cfg.name,
             model=cfg.model,
@@ -465,13 +469,68 @@ async def chat(payload: ChatRequest):
             elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
 
-    # charset 要显式写：只写 text/plain 时，某些客户端会按 latin-1 解码，中文变乱码。
+    async def generate_text():
+        last_usage = getattr(first_chunk, "usage_metadata", None)
+        yield first_chunk.content
+        async for chunk in stream:
+            if chunk.content:
+                yield chunk.content
+            if getattr(chunk, "usage_metadata", None):
+                last_usage = chunk.usage_metadata
+        _record(last_usage)
+
+    async def generate_sse():
+        last_usage = getattr(first_chunk, "usage_metadata", None)
+        sent_chars = 0
+
+        if first_chunk.content:
+            sent_chars += len(first_chunk.content)
+            yield _sse_event("message", text=first_chunk.content)
+
+        try:
+            async for chunk in stream:
+                if chunk.content:
+                    sent_chars += len(chunk.content)
+                    yield _sse_event("message", text=chunk.content)
+                if getattr(chunk, "usage_metadata", None):
+                    last_usage = chunk.usage_metadata
+        except Exception as e:
+            # 流已经开始了，状态行早发出去了，改不了状态码。
+            # 唯一能做的是发一个 error 事件，告诉客户端「断在哪、为什么」。
+            logger.warning("流中断流（已发 %d 字）：%s", sent_chars, type(e).__name__)
+            yield _sse_event(
+                "error",
+                reason=type(e).__name__,
+                message=_upstream_message(e, limit=200),
+                sent_chars=sent_chars,
+            )
+            _record(last_usage)
+            return
+
+        _record(last_usage)
+        yield _sse_event(
+            "done",
+            prompt_tokens=(last_usage or {}).get("input_tokens", 0),
+            completion_tokens=(last_usage or {}).get("output_tokens", 0),
+            sent_chars=sent_chars,
+        )
+
+    if payload.stream_format == "sse":
+        # X-Accel-Buffering: no —— 让 nginx 之类的反代别缓冲。
+        # 不加这个头，SSE 会被攒着一起发，实时性全丢。
+        return StreamingResponse(
+            generate_sse(),
+            media_type="text/event-stream; charset=utf-8",
+            headers={**headers, "X-Accel-Buffering": "no"},
+        )
+
+    # 过渡路径：Gradio 只认纯文本。
+    # 新前端（M1）上线后，删掉这条分支和 stream_format 参数，只留 SSE。
     return StreamingResponse(
-        generate_response(),
+        generate_text(),
         media_type="text/plain; charset=utf-8",
         headers=headers,
     )
-
 if __name__ == "__main__":
     import uvicorn
 

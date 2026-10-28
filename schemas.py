@@ -113,6 +113,10 @@ class ChatRequest(BaseModel):
         None,
         description="用哪个后端；不传则用服务端的默认 provider",
     )
+    stream_format: Literal["text", "sse"] = Field(
+        "text",
+        description="流式格式：text=纯文本（默认，兼容 Gradio）；sse=标准 Server-Sent Events",
+    )
     query: str = Field(..., min_length=1, max_length=8_000, description="用户本轮输入")
     sys_prompt: str = Field(
         "你是一个有用的助手", min_length=1, max_length=2_000, description="系统提示词"
