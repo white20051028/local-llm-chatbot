@@ -369,7 +369,7 @@ def test_400错误不重试(client, fast_retry, monkeypatch):
 
     r = client.post("/chat", json={"query": "hi"}, headers=HEADERS)
 
-    assert r.status_code == 502
+    assert r.status_code == 400      # 客户端错误，不是网关故障
     assert boom.calls == 1
 
 # ---------------------------------------------------------------- 多后端

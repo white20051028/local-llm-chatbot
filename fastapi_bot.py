@@ -32,6 +32,7 @@ import time
 from ratelimit import rate_limit
 import usage
 import tokens
+import re
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -247,6 +248,20 @@ def _should_fallback(exc: Exception) -> bool:
         return False
     return True
 
+def _upstream_message(exc: Exception, limit: int = 300) -> str:
+    """从上游异常里抠出人话。
+
+    openai 异常的 str() 常常是整段 dict，直接丢给用户没法看：
+      Error code: 400 - {'code': 20015, 'message': 'number of input tokens ...'}
+
+    这里优先取 message 字段，取不到才退回原始字符串。
+    """
+    text = str(exc)
+    match = re.search(r"'message':\s*'([^']*)'", text)
+    if match:
+        return match.group(1)[:limit]
+    return text[:limit]
+
 async def _open_stream(bound, messages, deadline: float | None = None):
     """打开上游流并返回 (stream, 第一个有内容的 chunk)。
 
@@ -409,6 +424,16 @@ async def chat(payload: ChatRequest):
             max_tokens=payload.max_tokens,
         )
     except Exception as e:
+        # 上游说"你的请求有问题"（4xx）→ 那是客户端的错，不能报成 502。
+        # 典型场景：历史太长、超过模型窗口（SiliconFlow 会返回 400 + 明确的 max_seq_len）。
+        if isinstance(e, openai.BadRequestError):
+            status = getattr(e, "status_code", 400) or 400
+            logger.warning("上游拒绝了这次请求：%s", _upstream_message(e))
+            raise HTTPException(
+                status_code=status,
+                detail=f"上游拒绝了请求：{_upstream_message(e)}",
+            )
+
         logger.exception("所有后端都失败")
         raise HTTPException(
             status_code=502,
