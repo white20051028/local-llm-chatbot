@@ -340,6 +340,82 @@ HTTP/1.1 400 Bad Request
 
 上游的原话被原样带出来了，用户一眼知道该改什么。
 
+## 🔌 SSE：断流怎么告诉客户端
+
+### 问题
+
+上游说一半就断了，之前是这样：
+
+```
+客户端：HTTP 200 + 部分内容 + IncompleteRead(15 bytes)
+服务端：一整页 traceback（看起来像崩溃）
+```
+
+客户端只知道「连接断了」，**不知道断在哪、为什么断**。而且服务端那页 traceback 会让运维以为进程炸了。
+
+### 现在：两种格式可选
+
+```json
+{"query": "...", "stream_format": "text"}   // 默认，兼容 Gradio
+{"query": "...", "stream_format": "sse"}    // 标准 SSE
+```
+
+SSE 的输出：
+
+```
+event: message
+data: {"text": "这是"}
+
+event: message
+data: {"text": "半句话"}
+
+event: error
+data: {"reason": "OpenAIConnectionError", "message": "Connection error.", "sent_chars": 5}
+```
+
+### 三个事件
+
+| 事件 | 什么时候 | 带什么 |
+|---|---|---|
+| `message` | 每收到一块内容 | `text` |
+| `done` | 正常结束 | `prompt_tokens` / `completion_tokens` / `sent_chars` |
+| `error` | 流开始之后出错 | `reason` / `message` / `sent_chars` |
+
+### 为什么 `data` 里放 JSON 不放纯文本
+
+SSE 协议允许 `data` 有多行，但**每一行都要单独加 `data: ` 前缀**。模型输出里换行太常见（列表、代码块），漏一行就悄悄把协议搞坏。
+
+`json.dumps` 会把换行转义成 `\n`，永远是单行。
+
+### 为什么只有「流开始后」才发 error 事件
+
+`event: error` 是 **SSE 响应体**的一部分。流**开始前**失败时，我们还没返回 `StreamingResponse`，返回的是一整个 JSON 响应——没法在 502 的 JSON 里塞 SSE 事件。
+
+所以分两段，合起来才是「所有失败都有明确反馈」：
+
+| 阶段 | 怎么告诉客户端 |
+|---|---|
+| 流开始前（连不上、401、400） | HTTP 状态码 + JSON `detail` |
+| 流开始后（说一半断了） | `event: error` |
+
+### 实测对比
+
+用 `tools/truncated_upstream.py`（发两块内容、不发 `[DONE]` 直接断开的假上游）：
+
+| | 改之前（text） | 改之后（sse） |
+|---|---|---|
+| 客户端收到 | `IncompleteRead(15 bytes)` | `event: error` + 结构化字段 |
+| 知道断在哪 | ❌ | ✅ `sent_chars: 5` |
+| 知道为什么 | ❌ | ✅ `reason: OpenAIConnectionError` |
+| 服务端日志 | 整页 traceback | **一条 WARNING** |
+
+### 已知取舍
+
+- **默认还是 `text`**：Gradio 不解析 SSE。这是一条**有期限的过渡路径**——新前端上线后删掉这条分支和 `stream_format` 参数，只留 SSE
+- **没有心跳**：SSE 常见做法是每 15 秒发一个注释行防代理超时。聊天场景回复通常几秒到几十秒，暂时不需要
+- **`error` 之后直接关闭连接**：流已经废了，继续发没有意义
+- **`sent_chars` 是字符数不是 token 数**：它的用途是让客户端知道「已经收到多少」，不是计费
+
 ## 🧪 运行测试
 
 ```bash

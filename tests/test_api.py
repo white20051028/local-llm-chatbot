@@ -46,6 +46,21 @@ class FakeModel:
         for piece in ("你", "好"):
             yield SimpleNamespace(content=piece)
 
+class TruncatedModel:
+    """先吐两块内容，再抛异常 —— 模拟上游说一半就断。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def bind(self, **kwargs):
+        return self
+
+    async def astream(self, messages):
+        self.calls += 1
+        yield SimpleNamespace(content="这是")
+        yield SimpleNamespace(content="半句话")
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
 class BoomModel:
     """假的失败模型：按指定次数抛同一个异常，并记录被调用了几次。"""
 
@@ -567,3 +582,28 @@ def test_短历史不会被裁剪(client):
 
     assert r.status_code == 200
     assert "X-History-Trimmed" not in r.headers
+
+# ---------------------------------------------------------------- SSE
+def test_sse正常流有message和done(client):
+    """SSE 格式：正常结束时应该有 message 事件和 done 事件。"""
+    r = client.post("/chat", json={"query": "hi", "stream_format": "sse"}, headers=HEADERS)
+
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers["content-type"]
+    assert "event: message" in r.text
+    assert "event: done" in r.text
+    assert "event: error" not in r.text
+    assert r.headers.get("x-accel-buffering") == "no"
+
+
+def test_sse中途断流发出error事件(client, monkeypatch):
+    """上游说一半就断：必须发 error 事件，而不是静默结束。"""
+    boom = TruncatedModel()
+    monkeypatch.setattr(fastapi_bot, "get_model", lambda provider=None: boom)
+
+    r = client.post("/chat", json={"query": "hi", "stream_format": "sse"}, headers=HEADERS)
+
+    assert r.status_code == 200          # 流已开始，状态码改不了
+    assert "event: error" in r.text
+    assert "sent_chars" in r.text
+    assert "event: done" not in r.text   # 断流不该有 done
