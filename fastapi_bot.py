@@ -31,6 +31,7 @@ from probe import probe_all
 import time
 from ratelimit import rate_limit
 import usage
+import tokens
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -362,36 +363,43 @@ async def use_totals():
 )
 async def chat(payload: ChatRequest):
     started_at = time.monotonic()
-    # 1. 按轮数裁剪历史。history_len=0 表示一条历史都不带。
-    #    原代码写的是 `if history_len > 0 and len(history) > history_len*2`，
-    #    history_len=0 时整个条件为假、直接跳过裁剪，反而把全部历史都带上了，
-    #    与界面上"0 = 不保留"的语义正好相反。这里换成"先算要留几条"。
-    keep = payload.history_len * 2
-    history = payload.history[-keep:] if keep > 0 else []
 
-    # 2. 组装消息列表。
-    #    history 里的 role 已经被 ChatMessage 限制成 user/assistant，
-    #    不会有调用方伪造的 system 指令混进来。
-    #    content 也已经在 schemas 里归一化成了字符串，这里直接 model_dump。
-    messages = [{"role": "system", "content": payload.sys_prompt}]
-    messages.extend(msg.model_dump() for msg in history)
-    messages.append({"role": "user", "content": payload.query})
-
-    # 3. 决定这次用哪些后端
-    #    显式指定了 provider 就只用它：用户说"我要 ollama"，就不该偷偷换成别的
+    # 1. 先决定这次用哪些后端 —— 因为裁剪历史要用它的上下文窗口
     if payload.provider:
-        chain = [payload.provider]
         if payload.provider not in _PROVIDERS:
             raise HTTPException(
                 status_code=400,
                 detail=f"未知的 provider：{payload.provider!r}；"
                        f"可用的有：{list(_PROVIDERS)}",
             )
+        chain = [payload.provider]
     else:
         chain = _CHAIN or [DEFAULT_PROVIDER]
     provider_name = chain[0]
 
-    # 4-5. 按链依次尝试：每个后端内部会重试，彻底不行才换下一个
+    # 2. 按轮数裁一遍（用户自己设的 history_len）
+    keep = payload.history_len * 2
+    history = [
+        m.model_dump() for m in (payload.history[-keep:] if keep > 0 else [])
+    ]
+
+    # 3. 再按 token 预算裁一遍：窗口的 70% 是硬上限。
+    #    先扣掉 system 和本轮 query，剩下的才给历史 ——
+    #    这两条是语义的地基，任何情况下都不能丢。
+    budget = int(_PROVIDERS[provider_name].context_window * 0.7)
+    reserve = (
+        tokens.count_tokens(payload.sys_prompt)
+        + tokens.count_tokens(payload.query)
+        + 2 * tokens.PER_MESSAGE_OVERHEAD
+    )
+    history, trimmed = tokens.trim_history(history, budget, reserve)
+
+    # 4. 组装消息列表
+    messages = [{"role": "system", "content": payload.sys_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": payload.query})
+
+    # 5. 按链依次尝试：每个后端内部会重试，彻底不行才换下一个
     try:
         used_name, stream, first_chunk = await _open_stream_with_fallback(
             chain,
@@ -410,11 +418,12 @@ async def chat(payload: ChatRequest):
     cfg = _PROVIDERS[used_name]
     headers = {"X-Provider": cfg.name, "X-Model": cfg.model}
     if used_name != provider_name:
-        headers["X-Fallback-From"] = provider_name      # 告诉调用方发生了降级
+        headers["X-Fallback-From"] = provider_name
+    if trimmed:
+        headers["X-History-Trimmed"] = str(trimmed)
 
     async def generate_response():
         # usage 是累计值：每次覆盖，绝对不能累加。
-        # first_chunk 也可能带 usage（第一个 chunk 只有 input，output 是 0）。
         last_usage = getattr(first_chunk, "usage_metadata", None)
 
         yield first_chunk.content
@@ -424,8 +433,6 @@ async def chat(payload: ChatRequest):
             if getattr(chunk, "usage_metadata", None):
                 last_usage = chunk.usage_metadata
 
-        # 走完整个流才记 —— 中途断流时这行不会执行，
-        # 那次的用量就没记上。可接受：断流本来就不是一次完整计费。
         usage.record(
             provider=cfg.name,
             model=cfg.model,
@@ -434,14 +441,11 @@ async def chat(payload: ChatRequest):
         )
 
     # charset 要显式写：只写 text/plain 时，某些客户端会按 latin-1 解码，中文变乱码。
-    # X-Provider / X-Model 让调用方一眼看出这次是谁服务的——
-    # 排查"到底切没切成功"全靠它，否则只能靠猜。
     return StreamingResponse(
         generate_response(),
         media_type="text/plain; charset=utf-8",
-        headers=headers
+        headers=headers,
     )
-
 
 if __name__ == "__main__":
     import uvicorn

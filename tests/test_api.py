@@ -23,6 +23,7 @@ import httpx
 import openai
 import ratelimit
 import usage
+from dataclasses import replace
 
 _REAL_GET_MODEL = fastapi_bot.get_model
 TEST_KEY = "test-key-0000"
@@ -530,3 +531,39 @@ def test_限流窗口滑动后恢复(monkeypatch):
 
 def test_覆盖usage为None():
     usage.record(provider="x",model="y",usage=None,elapsed_ms=1)
+
+# ---------------------------------------------------------------- token 预算裁剪
+def test_历史超预算会被裁剪(client, monkeypatch):
+    """把窗口调到很小，长历史应该被裁掉，响应头能看到条数。"""
+    name = fastapi_bot.DEFAULT_PROVIDER
+    cfg = fastapi_bot._PROVIDERS[name]
+    monkeypatch.setitem(fastapi_bot._PROVIDERS, name, replace(cfg, context_window=200))
+
+    history = [
+        {"role": "user", "content": "很长的一段历史" * 20},
+        {"role": "assistant", "content": "很长的回答" * 20},
+    ]
+    r = client.post(
+        "/chat",
+        json={"query": "hi", "history": history, "history_len": 10},
+        headers=HEADERS,
+    )
+
+    assert r.status_code == 200
+    assert int(r.headers["X-History-Trimmed"]) > 0
+
+
+def test_短历史不会被裁剪(client):
+    """正常长度的历史不该被动。"""
+    history = [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "你好，有什么可以帮你？"},
+    ]
+    r = client.post(
+        "/chat",
+        json={"query": "hi", "history": history, "history_len": 10},
+        headers=HEADERS,
+    )
+
+    assert r.status_code == 200
+    assert "X-History-Trimmed" not in r.headers
