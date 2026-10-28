@@ -28,7 +28,7 @@ class ProviderConfig:
     base_url: str
     model: str
     api_key_env: str
-
+    context_window: int = 8192      # 没填时的保守默认
 
 @dataclass(frozen=True)
 class BackendState:
@@ -93,6 +93,7 @@ def build_providers(data: dict) -> dict[str, ProviderConfig]:
             model=item["model"],
             # api_key_env 可以省略：本地 Ollama 不需要密钥
             api_key_env=item.get("api_key_env", ""),
+            context_window=int(item.get("context_window", 8192)),
         )
     return providers
 
