@@ -368,7 +368,7 @@ async def list_providers():
     summary="查看累计token用量",
     dependencies=[Depends(require_api_key)]
 )
-async def use_totals():
+async def get_usage_totals():
     return usage.totals()
 
 @app.post(

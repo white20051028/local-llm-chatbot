@@ -462,29 +462,32 @@ $ python tools/probe_failure.py
 
 ```
 .
-├── fastapi_bot.py        # 后端：路由、模型客户端、异常处理
+├── fastapi_bot.py        # HTTP 层：路由、端点、请求编排
 ├── schemas.py            # 请求体模型（Pydantic），负责字段与上下界校验
 ├── auth.py               # API Key 鉴权依赖
 ├── providers.toml        # 模型后端注册表（结构在此，密钥在 .env）
 ├── providers.py          # 读取并校验 providers.toml，生成降级链
 ├── probe.py              # 启动时探测每个后端能不能出字（max_tokens=1）
+├── tokens.py             # token 估算与历史裁剪
+├── ratelimit.py          # 滑动窗口限流
 ├── usage.py              # token 用量记录与累计
 ├── gradio_ui.py          # 前端：Gradio 聊天界面与参数面板
 ├── tests/
-│   └── test_api.py       # 接口测试（pytest，34 条）
+│   ├── conftest.py       # 关掉启动探测，保证测试不联网
+│   └── test_api.py       # 接口测试（pytest，44 条）
 ├── tools/                # 手工排错与验证脚本（不参与自动测试）
-│   ├── smoke.py                # 校验层冒烟测试
-│   ├── smoke_auth.py           # 鉴权层冒烟测试
-│   ├── check_schema.py         # schema 约束自检
+│   ├── try_provider.py         # 试任意后端，打印 X-Provider / X-Model / 耗时
 │   ├── check_providers.py      # providers 加载器自检
 │   ├── show_providers.py       # 打印解析后的后端配置
 │   ├── probe_failure.py        # 打一次 /chat，打印状态码/耗时/响应体
 │   ├── silent_upstream.py      # 假上游：接受连接但永不响应
 │   ├── measure_model_timeout.py # 测模型层多久放弃
-│   └── measure_retry.py        # 一条命令测重试次数与总耗时
-├── docs/
-│   ├── TROUBLESHOOTING.md   # 踩坑记录：七个真实故障的现象/根因/修法
-│   └── 优化与学习流程.md      # 从 demo 到可用服务的完整改造过程
+│   ├── measure_retry.py        # 一条命令测重试次数与总耗时
+│   └── oneoff/                 # 早期一次性脚本，功能已被 pytest 覆盖
+│       ├── smoke.py
+│       ├── smoke_auth.py
+│       └── check_schema.py
+├── docs/                 # 文档，索引见 docs/README.md
 ├── static/               # 本地化的 swagger-ui 资源（/docs 不依赖 CDN）
 │   ├── swagger-ui-bundle.js
 │   └── swagger-ui.css
