@@ -175,6 +175,65 @@ retry-after: 37
 
 > 37 秒是因为窗口是 60 秒，而第 1 次请求已经过去 23 秒：`37 + 23 = 60`。
 
+## 💰 用量计量
+
+每次请求记一行 JSON 日志：
+
+```
+[usage] {"provider": "siliconflow", "model": "Qwen/Qwen2.5-7B-Instruct", "prompt_tokens": 18, "completion_tokens": 7, "total_tokens": 25, "elapsed_ms": 422, "usage_missing": false}
+```
+
+累计值经 `/usage` 查看（需要鉴权）：
+
+```bash
+curl http://127.0.0.1:6066/usage -H "X-API-Key: $GATEWAY_API_KEY"
+```
+
+```json
+{"requests": 3, "prompt_tokens": 115, "completion_tokens": 115, "usage_missing": 0}
+```
+
+### 三个实测踩出来的坑
+
+**① usage 是累计值，不是增量**
+
+流式响应里每个 chunk 都带 usage，但数字是"到目前为止"的：
+
+```
+idx 1 : output_tokens = 0     ← 还没出字，只有 input
+idx 2 : output_tokens = 1
+...
+idx 28: output_tokens = 27    ← 这才是最终值
+idx 29: output_tokens = 27    ← 重复一次，没有文字
+```
+
+所以必须**覆盖**保存，不能 `+=`。写成累加会得到 `0+1+2+…+27 = 378`，比真实值大 14 倍，而且**不会报错**。
+
+**② 不同厂商行为不一致**
+
+| 后端 | 流式默认返回 usage？ |
+|---|---|
+| SiliconFlow | ✅ 返回 |
+| Ollama | ❌ **不返回**，必须传 `stream_options={"include_usage": True}` |
+
+所以统一在 `get_model()` 里加上这个参数。注意要用 `model_kwargs={"stream_options": ...}` 传——直接传会触发 langchain 的 `stream_options is not default parameter` 警告。
+
+**③ 拿不到 usage 不能让请求失败**
+
+记 `usage_missing: true` + token 记 0，请求照样成功。**计量是旁路，不是主路径。**
+
+### `elapsed_ms` 的口径
+
+记的是**从收到请求到流结束**的总时间，**包含重试等待**。
+
+实测有一回：第一次超时重试，`elapsed_ms: 17016`。如果只记最后一次成功调用的时间，就会记成 2 秒——把"用户实际等了 17 秒"这件事掩盖掉。
+
+### 已知限制
+
+- **重启清零**：累计值在进程内存里
+- **不区分 key**：所有调用方混在一起算，要分账得按 `X-API-Key` 分别累计
+- **不折算钱**：只记 token 数，没有乘以单价。算成本需要一张「模型 → 单价」表
+
 ## 🧪 运行测试
 
 ```bash
@@ -303,6 +362,7 @@ $ python tools/probe_failure.py
 ├── providers.toml        # 模型后端注册表（结构在此，密钥在 .env）
 ├── providers.py          # 读取并校验 providers.toml，生成降级链
 ├── probe.py              # 启动时探测每个后端能不能出字（max_tokens=1）
+├── usage.py              # token 用量记录与累计
 ├── gradio_ui.py          # 前端：Gradio 聊天界面与参数面板
 ├── tests/
 │   └── test_api.py       # 接口测试（pytest，34 条）

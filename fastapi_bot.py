@@ -30,6 +30,7 @@ from providers import BackendState, build_chain, load_providers
 from probe import probe_all
 import time
 from ratelimit import rate_limit
+import usage
 
 # 挂到 uvicorn 的 logger 上，这样日志会出现在你启动服务的那个控制台里
 logger = logging.getLogger("uvicorn.error")
@@ -187,8 +188,12 @@ def get_model(provider: str | None = None) -> ChatOpenAI:
             model=cfg.model,
             request_timeout=(connect_timeout, read_timeout),
             max_retries=0,
+            # 统一要求上游在流的最后补一个 usage。
+            # 为什么必须显式要求：Ollama 的流式默认**不返回** usage，
+            # 而 SiliconFlow 默认返回（多一个纯 usage 的 chunk，无害）。
+            # 用 model_kwargs 传：直接传会触发 langchain 的警告。
+            model_kwargs={"stream_options": {"include_usage": True}},
         )
-
     return _clients[name]
 
 # 这里加了个配置回显，以后一条名了就可以看出服务到底在和谁说话 curl.exe -s http://127.0.0.1:6066/health
@@ -341,12 +346,22 @@ async def list_providers():
             for cfg in _PROVIDERS.values()
         ],
     }
+
+@app.get(
+    "/usage",
+    summary="查看累计token用量",
+    dependencies=[Depends(require_api_key)]
+)
+async def use_totals():
+    return usage.totals()
+
 @app.post(
     "/chat",
     summary="流式对话接口",
     dependencies=[Depends(require_api_key), Depends(rate_limit)],
 )
 async def chat(payload: ChatRequest):
+    started_at = time.monotonic()
     # 1. 按轮数裁剪历史。history_len=0 表示一条历史都不带。
     #    原代码写的是 `if history_len > 0 and len(history) > history_len*2`，
     #    history_len=0 时整个条件为假、直接跳过裁剪，反而把全部历史都带上了，
@@ -398,10 +413,25 @@ async def chat(payload: ChatRequest):
         headers["X-Fallback-From"] = provider_name      # 告诉调用方发生了降级
 
     async def generate_response():
+        # usage 是累计值：每次覆盖，绝对不能累加。
+        # first_chunk 也可能带 usage（第一个 chunk 只有 input，output 是 0）。
+        last_usage = getattr(first_chunk, "usage_metadata", None)
+
         yield first_chunk.content
         async for chunk in stream:
             if chunk.content:
                 yield chunk.content
+            if getattr(chunk, "usage_metadata", None):
+                last_usage = chunk.usage_metadata
+
+        # 走完整个流才记 —— 中途断流时这行不会执行，
+        # 那次的用量就没记上。可接受：断流本来就不是一次完整计费。
+        usage.record(
+            provider=cfg.name,
+            model=cfg.model,
+            usage=last_usage,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+        )
 
     # charset 要显式写：只写 text/plain 时，某些客户端会按 latin-1 解码，中文变乱码。
     # X-Provider / X-Model 让调用方一眼看出这次是谁服务的——

@@ -22,6 +22,7 @@ from fastapi_bot import app, get_model
 import httpx
 import openai
 import ratelimit
+import usage
 
 _REAL_GET_MODEL = fastapi_bot.get_model
 TEST_KEY = "test-key-0000"
@@ -526,3 +527,6 @@ def test_限流窗口滑动后恢复(monkeypatch):
 
     now[0] += 61          # 过了窗口
     ratelimit.rate_limit("k")      # 不该抛
+
+def test_覆盖usage为None():
+    usage.record(provider="x",model="y",usage=None,elapsed_ms=1)
