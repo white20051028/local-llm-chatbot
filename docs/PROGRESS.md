@@ -66,7 +66,7 @@
 | 8 | token 预算裁剪（tiktoken） | ⬜ |
 | 9 | 用量计量 | ✅ `4ad3b0e`（含 `/usage` 端点） |
 | 10 | `/metrics` 可观测 | ⬜ 加分项 |
-| 11 | ≥15 用例 + CI | 用例 ✅ 38 条；CI ⬜ |
+| 11 | ≥15 用例 + CI | ✅ **42 条用例 + GitHub Actions**（PR #5） |
 | 12 | docker compose | ⬜ 加分项 |
 
 **5 天排期**
